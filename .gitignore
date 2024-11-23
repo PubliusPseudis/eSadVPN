@@ -1,0 +1,53 @@
+# Build directories
+/target/
+/build/
+
+# Exclude all generated files except Javadocs
+/target/*
+!/target/apidocs/
+
+# NetBeans-specific files
+/nbactions.xml
+/nb-configuration.xml
+
+# Maven-specific files
+.mvn/
+pom.xml.releaseBackup
+pom.xml.tag
+release.properties
+
+# Generated source files
+/generated-sources/
+/generated-test-sources/
+
+# Class files
+*.class
+
+# Temporary files
+*.swp
+*.swo
+*~
+
+# Logs and temp files
+*.log
+/tmp/
+
+# IDE-specific files
+/.idea/
+/.vscode/
+*.iml
+
+# Dependencies
+/dependencies/
+/archive-tmp/
+
+# JAR and other binary files
+*.jar
+*.war
+*.ear
+*.exe
+*.dll
+
+# Miscellaneous
+.DS_Store
+Thumbs.db
