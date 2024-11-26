@@ -1,121 +1,161 @@
-Overview 
-========
+# Overview
 
 **ESADVPN (Everyday Swarm Assisted Decentralized VPN)** is a
-peer-to-peer, decentralized Virtual Private Network designed to provide
-secure, scalable, and resilient internet access. Built around a swarm
-intelligence-based routing system, it ensures efficient peer discovery
-and data relay without relying on centralized infrastructure. ESADVPN
-integrates a TLS-enabled SOCKS proxy and advanced protocols like dynamic
-proof-of-work and gossip-based peer synchronization for robust network
-operation.
+peer-to-peer, decentralized Virtual Private Network (VPN) designed to
+provide secure, scalable, and resilient internet access. It leverages
+swarm intelligence for routing and a gossip-based protocol for efficient
+network synchronization, eliminating the need for centralized
+infrastructure. The integration of a SOCKS proxy ensures seamless
+compatibility with local applications.
 
-Key Features 
-============
+# Key Features
 
--   **TLS-Enabled SOCKS Proxy:** Securely routes encrypted traffic
-    through the VPN, preventing plaintext data leaks.
+  - **SOCKS Proxy for Local Use:** Routes application traffic through
+    the VPN, intended for local or trusted LAN connections. Users must
+    ensure application-level encryption for sensitive data (e.g.,
+    HTTPS).
 
--   **Swarm-Based Peer Discovery:** Uses a gossip protocol with
-    anti-replay protection to synchronize network state efficiently.
+  - **Peer-to-Peer Architecture:** Operates without reliance on
+    centralized servers, ensuring maximum resilience.
 
--   **Dynamic Proof-of-Work (PoW):** Adapts difficulty dynamically to
-    prevent Sybil attacks while maintaining network performance.
+  - **Swarm Intelligence Routing:** Implements pheromone-based
+    algorithms for adaptive and efficient packet forwarding.
 
--   **Decentralized Routing:** Implements swarm intelligence algorithms
-    for efficient packet forwarding and low-latency routes.
+  - **Dynamic Proof-of-Work (PoW):** Adjusts difficulty dynamically to
+    balance resource usage and prevent Sybil attacks.
 
--   **Rate Limiting and Reputation Scoring:** Protects against abuse by
-    monitoring and penalizing malicious peers while rewarding reliable
-    nodes.
+  - **Gossip Protocol with Anti-Replay Protection:** Synchronizes the
+    network state incrementally using nonces and timestamps to prevent
+    replay attacks.
 
-Quick Start 
-===========
+  - **Rate Limiting and Reputation Scoring:** Penalizes malicious nodes
+    while rewarding reliable peers for a healthy network ecosystem.
 
-Prerequisites 
--------------
+  - **Buffer Pooling:** Efficient memory management ensures smooth
+    performance under high packet loads.
 
--   Java 17 or later.
+# Technical Highlights
 
--   Maven for dependency management.
+## Architecture Overview
 
--   Optional: A valid TLS certificate for production environments.
+  - **Swarm Router:** Utilizes pheromone-based path selection for
+    efficient and scalable routing.
 
-Building the Project 
---------------------
+  - **Gossip Protocol:** Reduces bandwidth usage by propagating
+    incremental updates rather than full state synchronization.
 
-Clone the repository and build the project:
+  - **Virtual Network Interface:** Injects and processes IP packets
+    seamlessly for local application compatibility.
+
+  - **Dynamic Rate Limiting:** Employs per-peer rate limits to ensure
+    fair resource usage and mitigate abuse.
+
+  - **Anti-Replay Mechanism:** Nonces and timestamps validate incoming
+    messages to prevent replay attacks.
+
+  - **Exit Node Monitoring:** Reputation-based scoring and rate limiting
+    prevent misuse and ensure network integrity.
+
+# Strengths
+
+  - **Decentralization:** Fully peer-to-peer architecture eliminates
+    reliance on centralized infrastructure, enhancing privacy and
+    resilience.
+
+  - **Efficient Routing:** Swarm intelligence algorithms ensure
+    low-latency and adaptive load balancing across the network.
+
+  - **Scalability:** Gossip-based peer synchronization minimizes
+    bandwidth usage and supports large-scale networks.
+
+  - **Security:** Integration of dynamic PoW, anti-replay measures, and
+    rate limiting safeguards the network’s integrity.
+
+# Weaknesses
+
+  - **Exit Node Risks:** While exit nodes are monitored, they still pose
+    potential risks, especially if users fail to encrypt their traffic.
+
+  - **Latency Sensitivity:** High-latency environments may impact the
+    performance of swarm-based routing.
+
+  - **Proof-of-Work Overheads:** Dynamic PoW can introduce computational
+    overhead, especially for low-resource devices.
+
+  - **Initial Peer Discovery:** Dependence on user-provided peer
+    information for bootstrapping can be a hurdle for non-technical
+    users.
+
+# Areas for Improvement
+
+  - **Improved Exit Node Transparency:** Introduce mechanisms to audit
+    and verify exit node behavior.
+
+  - **Simplified Onboarding:** Develop a user-friendly interface for
+    easier configuration and initial peer discovery.
+
+  - **Energy Efficiency:** Optimize the dynamic PoW algorithm to reduce
+    energy consumption on resource-constrained devices.
+
+  - **Enhanced Metadata Protection:** Incorporate additional measures to
+    minimize metadata leaks, such as randomized traffic padding.
+
+  - **Real-Time Monitoring:** Provide tools for users to visualize
+    network performance and the trustworthiness of connected peers.
+
+# Quick Start
+
+## Prerequisites
+
+  - Java 17 or later.
+
+  - Maven for building dependencies.
+
+## Building the Project
+
+Clone the repository and build the application:
 
     git clone https://github.com/publiuspseudis/esadvpn.git
     cd esadvpn
     mvn clean package
 
-Running ESADVPN 
----------------
+## Running ESADVPN
 
-Start ESADVPN in one of the following modes:
-
-#### P2P Mode (First Node):
+**P2P Mode (First Node):**
 
     java -jar target/esadvpn.jar p2p [port]
 
-*Example: Start the first node on port 8942. SOCKS proxy will start on
-port 8943.*
+\*Example:\* Start the first node on port 8942. The SOCKS proxy will
+listen on port 8943.
 
-#### Connect Mode (Join Existing Network):
+**Connect Mode (Join Existing Network):**
 
     java -jar target/esadvpn.jar connect [local-port] [peer-host] [peer-port]
 
-*Example: Join an existing network via localhost on port 8942 and start
-a SOCKS proxy on port 8945.*
+\*Example:\* Join a network via localhost on port 8942. Start the VPN on
+port 8944 and the SOCKS proxy on port 8945.
 
-Security Notes 
-==============
+# Security Notes
 
--   All traffic routed through the SOCKS proxy must use encryption
-    (e.g., HTTPS or TLS tunnels).
+  - **Local SOCKS Proxy Use:** The SOCKS proxy is designed for local or
+    trusted LAN connections. It does not encrypt traffic by itself.
+    Users should ensure that routed traffic is encrypted at the
+    application level (e.g., HTTPS).
 
--   Peers must validate gossip messages using nonces and timestamps to
-    prevent replay attacks.
+  - **End-to-End Encryption:** Traffic leaving the VPN exit node is
+    vulnerable to interception unless encrypted. Always use
+    application-layer security for sensitive data.
 
--   Exit nodes are monitored for abuse with rate limiting and reputation
-    scoring mechanisms.
+  - **Replay Attack Prevention:** Gossip messages use nonces and
+    timestamps to prevent replay attacks, maintaining network integrity.
 
-Architecture Highlights 
-=======================
-
--   **Swarm Router:** Ensures optimized routing using pheromone-based
-    path selection.
-
--   **Gossip Protocol:** Synchronizes network state incrementally to
-    reduce bandwidth usage.
-
--   **Virtual Network Interface:** Processes and injects IP packets for
-    seamless integration with local applications.
-
--   **Buffer Pooling:** High-efficiency buffer management for packet
-    processing under load.
-
-Contributing 
-============
-
-We welcome contributions to ESADVPN! Follow these steps:
-
-1.  Fork the repository on GitHub.
-
-2.  Create a feature branch (`git checkout -b feature-name`).
-
-3.  Commit your changes and open a pull request.
-
-License 
-=======
+# License
 
 This project is licensed under the **GNU General Public License v3**.
-See the `LICENSE` file for more details.
+See the `LICENSE` file for details.
 
-Contact
-=======
+# Contact
 
 For issues, suggestions, or inquiries, visit the repository at [GitHub
 Repository](https://github.com/publiuspseudis/esadvpn) or contact
-publius on nostr.
+*Publius Pseudis* on Nostr.
