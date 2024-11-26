@@ -28,6 +28,7 @@ import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.security.SecureRandom;
@@ -45,6 +46,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.logging.Level;
+import org.publiuspseudis.esadvpn.network.PeerDiscovery.ConnectionMode;
+import org.publiuspseudis.esadvpn.proxy.SocksProxy;
 import org.publiuspseudis.esadvpn.routing.RouteInfo;
 import org.publiuspseudis.esadvpn.routing.SwarmRouter;
 import org.slf4j.Logger;
@@ -127,6 +131,17 @@ import org.slf4j.LoggerFactory;
  */
 public final class P2PNetwork implements GossipMessage.GossipHandler, AutoCloseable {
     /**
+     * The {@link PeerDiscovery} instance responsible for discovering and managing peers within the P2P network.
+     *
+     * <p>
+     * This component handles the discovery of new peers through various mechanisms such as local network scanning
+     * and bootstrap server queries. It maintains an updated list of available peers to facilitate connection establishment
+     * and network expansion.
+     * </p>
+     */
+    private final PeerDiscovery peerDiscovery;
+
+    /**
      * Logger instance for logging information, warnings, and errors.
      */
     private static final Logger log = LoggerFactory.getLogger(P2PNetwork.class);
@@ -193,7 +208,7 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
      * The socket timeout duration in milliseconds for peer connections.
      */
     private static final int SOCKET_TIMEOUT = 30000;
-    
+    private final int THREAD_POOL_SIZE = Math.min(Runtime.getRuntime().availableProcessors(), 4);
     /**
      * The number of connection retry attempts when attempting to connect to a peer.
      */
@@ -265,6 +280,7 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
         this.connectionHandler = handler;
     }
 
+
     /**
      * Creates a new P2P VPN network node.
      *
@@ -272,7 +288,7 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
      * @param isInitiator A flag indicating whether this node is initiating a new network.
      * @throws IOException If there is an error during network setup, such as binding to the specified port.
      */
-    public P2PNetwork(int port, boolean isInitiator) throws IOException {
+      public P2PNetwork(int port, boolean isInitiator, String peerAddress) throws IOException {
         this.port = port;
         this.nodeId = generateNodeId();
         this.ipAddress = isInitiator ? "10.0.0.1" : "10.0.1.1";
@@ -280,6 +296,23 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
         this.bytesSent = new ConcurrentHashMap<>();
         this.bytesReceived = new ConcurrentHashMap<>();
         this.isInitiator = isInitiator;
+
+        // Create executor services with custom thread factories
+        this.executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE, r -> {
+            Thread t = new Thread(r);
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY); // Lower priority for background tasks
+            return t;
+        });
+
+        this.scheduler = Executors.newScheduledThreadPool(2, r -> {
+            Thread t = new Thread(r);
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            t.setName("P2P-Scheduler-" + t.getId());
+            return t;
+        });
+
         // Initialize core components
         this.router = new SwarmRouter();
         this.networkStack = new NetworkStack(ipAddress, router);
@@ -291,15 +324,7 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
         this.serverSocket.setReuseAddress(true);
         this.serverSocket.bind(new InetSocketAddress(port));
         
-        // Initialize thread pools
-        this.scheduler = Executors.newScheduledThreadPool(4);
-        this.executor = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r);
-            t.setDaemon(true);
-            return t;
-        });
-        
-        // Set up periodic tasks
+        // Set up periodic tasks with more reasonable intervals
         scheduler.scheduleAtFixedRate(this::gossip, 30, 30, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(this::updateProofOfWork, 20, 20, TimeUnit.HOURS);
         scheduler.scheduleAtFixedRate(this::sendKeepalive, 5, 5, TimeUnit.SECONDS);
@@ -308,7 +333,7 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
         scheduler.scheduleAtFixedRate(natHandler::cleanupExpiredMappings, 1, 1, TimeUnit.MINUTES);
         scheduler.scheduleAtFixedRate(this::checkPeerCount, 1, 1, TimeUnit.MINUTES);
         scheduler.scheduleAtFixedRate(this::logStats, 5, 5, TimeUnit.MINUTES);
-        
+
         // Set up UDP handlers
         setupUDPHandlers();
         
@@ -324,22 +349,89 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
                 log.error("Failed to handle new peer: {}", e.getMessage());
             }
         });
+        
+        // Initialize peer discovery with appropriate mode and peer info
+        ConnectionMode mode;
+        String directPeer = null;
+        if (isInitiator) {
+            mode = PeerDiscovery.ConnectionMode.LOCAL_NETWORK;
+        } else if (peerAddress != null) {
+            mode = PeerDiscovery.ConnectionMode.DIRECT_PEER;
+            directPeer = peerAddress;
+        } else {
+            mode = PeerDiscovery.ConnectionMode.LOCAL_NETWORK;
+        }
+
+        this.peerDiscovery = new PeerDiscovery(
+            nodeId, 
+            pow,
+            mode,
+            directPeer,
+            "bootstrap1.example.com:51820",
+            "bootstrap2.example.com:51820"
+        );
+
+        // Start bootstrap process if not initiator
+        if (!isInitiator) {
+            try {
+                Set<InetSocketAddress> peers = peerDiscovery.bootstrap();
+                if (peers.isEmpty()) {
+                    throw new IOException("Could not find any peers");
+                }
+                connectToInitialPeers(peers);
+            } catch (IOException e) {
+                log.error("Bootstrap failed: {}", e.getMessage());
+                throw e;
+            }
+        }
     }
-    
+
+
+    private void connectToInitialPeers(Set<InetSocketAddress> peers) {
+        // Connect to a subset of peers
+        List<InetSocketAddress> peerList = new ArrayList<>(peers);
+        Collections.shuffle(peerList);
+        int connectCount = Math.min(3, peerList.size());
+        
+        for (int i = 0; i < connectCount; i++) {
+            InetSocketAddress peer = peerList.get(i);
+            try {
+                connectToPeer(peer.getAddress().getHostAddress(), peer.getPort());
+            } catch (IOException e) {
+                log.warn("Failed to connect to peer {}: {}", peer, e.getMessage());
+            }
+        }
+    }
+
+   
     /**
-     * Generates a unique node ID using a secure random number generator.
+     * Generates a unique node identifier using a secure random number generator.
      *
-     * @return A byte array representing the unique node ID.
+     * <p>
+     * This method creates a 32-byte array filled with cryptographically strong random bytes to serve as the
+     * unique identifier for the network node. Ensuring uniqueness is crucial for peer identification and
+     * network integrity.
+     * </p>
+     *
+     * @return A {@code byte[]} representing the unique node ID.
      */
-    private byte[] generateNodeId() {
+    private static byte[] generateNodeId() {
+        // Use a larger size for better uniqueness
         byte[] id = new byte[32];
         new SecureRandom().nextBytes(id);
         return id;
     }
 
+
     
     /**
-     * Sets up UDP handlers for managing VPN traffic. This is only configured if the node is an initiator.
+     * Configures UDP handlers for managing VPN traffic.
+     *
+     * <p>
+     * This method sets up the necessary handlers for processing incoming and outgoing VPN packets.
+     * It binds to the specified port and delegates packet handling to appropriate callbacks. This setup
+     * is only performed if the node is designated as an initiator.
+     * </p>
      */
     private void setupUDPHandlers() {
         // Handle VPN traffic - only bind if we're an initiator
@@ -381,11 +473,17 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
     
     /**
-     * Updates the statistics for data sent or received from a peer.
+     * Updates the traffic statistics for a specific peer.
      *
-     * @param peerId     The identifier of the peer.
-     * @param bytes      The number of bytes sent or received.
-     * @param isReceived A flag indicating whether the bytes were received (true) or sent (false).
+     * <p>
+     * This method increments the byte counters for a given peer based on whether the data was sent
+     * or received. It ensures that traffic metrics are accurately maintained for monitoring and
+     * bandwidth estimation purposes.
+     * </p>
+     *
+     * @param peerId     The identifier of the peer (typically in the format "address:port").
+     * @param bytes      The number of bytes to add to the counter.
+     * @param isReceived {@code true} if the bytes were received from the peer; {@code false} if sent to the peer.
      */
     private void updatePeerStats(String peerId, int bytes, boolean isReceived) {
         Map<String, Long> stats = isReceived ? bytesReceived : bytesSent;
@@ -395,97 +493,219 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Starts the network node by solving the initial proof of work, setting up UDP listeners if initiator,
-     * and beginning to accept peer connections and route packets.
+     * Initiates the P2P network node by solving the initial proof of work, setting up UDP listeners if initiator,
+     * and preparing the node to accept peer connections and route network packets.
      *
-     * @throws IOException  If there is an error during startup, such as failing to bind the UDP port.
-     * @throws Exception    If the proof of work cannot be solved.
+     * <p>
+     * This method performs the following actions:
+     * <ul>
+     *   <li>Solves the initial proof of work to authenticate the node within the network.</li>
+     *   <li>If the node is an initiator, it sets up the necessary listeners for incoming connections.</li>
+     *   <li>Connects to initial peers obtained from the bootstrap process.</li>
+     *   <li>Starts background services for accepting connections, routing packets, and managing proxies.</li>
+     *   <li>Initializes the SOCKS proxy to facilitate external applications to use the VPN network.</li>
+     * </ul>
+     * </p>
+     *
+     * @throws IOException  If there is an error during network setup, such as binding to the specified port.
+     * @throws Exception    If the proof of work cannot be solved or other initialization errors occur.
      */
     public void start() throws IOException, Exception {
         // Solve initial proof of work
         if (!pow.solve()) {
             throw new RuntimeException("Failed to generate initial proof of work");
         }
-    
-        // Create initial UDP listener
-        if (isInitiator) {
-            log.info("Starting UDP listener on port {}", port);
-            try (DatagramSocket testSocket = new DatagramSocket(null)) {
-                testSocket.setReuseAddress(true);
-                testSocket.bind(new InetSocketAddress("0.0.0.0", port));
-                testSocket.close();
-                log.info("UDP port {} is available", port);
+
+        try {
+            if (isInitiator) {
+                log.info("Starting initiator node on port {}", port);
+
+                // Create and start initiator connection
+                VPNConnection serverConn = new VPNConnection("0.0.0.0", port, true, nodeId, pow);
+                serverConn.setGossipHandler(this);
+
+            } else {
+                // For non-initiator nodes
+                try {
+                    // First try to find and connect to peers
+                    Set<InetSocketAddress> peers_ = peerDiscovery.bootstrap();
+                    if (peers_.isEmpty()) {
+                        throw new IOException("Could not find any peers");
+                    }
+                    connectToInitialPeers(peers_);
+
+                    // We're already connected and listening through the VPNConnection 
+                    // created in connectToInitialPeers - no need for a second listener
+                    log.info("Connected to peers successfully, ready for traffic");
+
+                } catch (IOException e) {
+                    log.error("Failed to initialize network: {}", e.getMessage());
+                    throw e;
+                }
+            }
+
+            // Start services that are common to both modes
+            // Start threads with debug logging
+            executor.submit(() -> {
+                Thread.currentThread().setName("AcceptConnectionsThread");
+                log.info("Starting AcceptConnectionsThread");
+                acceptConnections();
+            });
+
+            executor.submit(() -> {
+                Thread.currentThread().setName("RoutePacketsThread");
+                log.info("Starting RoutePacketsThread");
+                routePackets();
+            });
+
+            // Start SOCKS proxy
+            try {
+                int socksPort = port + 1;  // Use next port for SOCKS proxy
+                log.info("Starting SOCKS proxy on port {}", socksPort);
+                new SocksProxy(networkStack.getUDPHandler(), socksPort);
+                log.info("SOCKS proxy started successfully on port {}", socksPort);
             } catch (IOException e) {
-                log.error("UDP port {} is not available: {}", port, e.getMessage());
+                log.error("Failed to start SOCKS proxy: {}", e.getMessage());
                 throw e;
             }
-            VPNConnection serverConn = new VPNConnection(null, port, true);
-            serverConn.setGossipHandler(this);
+
+            log.info("Network node fully started and ready for connections");
+        } catch (Exception e) {
+            log.error("Failed to start network: {}", e.getMessage());
+            throw e;
         }
-    
-        // Start accepting connections
-        executor.submit(this::acceptConnections);
-        
-        // Start packet routing
-        executor.submit(this::routePackets);
-        
-        log.info("Network node fully started and ready for connections");
     }
 
 
-     /**
-     * Continuously accepts incoming peer connections and handles them.
+
+
+    /**
+     * Continuously listens for and accepts incoming peer connection requests.
+     *
+     * <p>
+     * This method runs in a dedicated thread and handles new connections by delegating them to
+     * the {@link #handleNewPeer(Socket)} method. It ensures that the node can accept multiple
+     * peer connections concurrently, respecting the maximum peer limit.
+     * </p>
      */
-    private void acceptConnections() {
-        while (running && !Thread.currentThread().isInterrupted()) {
-            try {
-                Socket socket = serverSocket.accept();
-                socket.setSoTimeout(SOCKET_TIMEOUT);
-                
-                // Check peer limit
-                if (peers.size() >= MAX_PEERS) {
-                    log.warn("Rejecting connection from {}: peer limit reached", 
-                        socket.getInetAddress());
-                    socket.close();
-                    continue;
-                }
-                
-                executor.submit(() -> handleNewPeer(socket));
-                
-            } catch (IOException e) {
-                if (running) {
-                    log.error("Error accepting connection: {}", e.getMessage());
+       private void acceptConnections() {
+        Thread.currentThread().setName("P2P-AcceptLoop");
+        Thread.currentThread().setPriority(Thread.NORM_PRIORITY);
+        
+        try {
+            log.info("Starting accept loop with socket timeout: {}", 
+                serverSocket.getSoTimeout());
+            
+            serverSocket.setReuseAddress(true);
+            serverSocket.setSoTimeout(1000); // 1 second timeout
+            
+            while (running && !Thread.currentThread().isInterrupted()) {
+                try {
+                    Socket socket = serverSocket.accept();
+                    socket.setSoTimeout(SOCKET_TIMEOUT);
+
+                    if (peers.size() >= MAX_PEERS) {
+                        log.warn("Rejecting connection from {}: peer limit reached", 
+                            socket.getInetAddress());
+                        socket.close();
+                        continue;
+                    }
+
+                    // Submit connection handling with a meaningful thread name
+                    executor.submit(() -> {
+                        Thread.currentThread().setName("P2P-PeerHandler-" + socket.getInetAddress());
+                        Thread.currentThread().setPriority(Thread.MIN_PRIORITY);
+                        try {
+                            handleNewPeer(socket);
+                        } catch (Exception e) {
+                            log.error("Error handling new peer: {}", e.getMessage());
+                        }
+                    });
+
+                } catch (SocketTimeoutException e) {
+                    // This is expected, just continue
+                    Thread.sleep(100);
+                } catch (IOException e) {
+                    if (running) {
+                        log.error("Error accepting connection: {}", e.getMessage());
+                        Thread.sleep(1000); // Back off on error
+                    }
                 }
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("Accept loop interrupted");
+        } catch (Exception e) {
+            log.error("Fatal error in accept loop: {}", e.getMessage());
         }
     }
     
     /**
-     * The main loop for routing packets. Continuously retrieves packets from the router and routes them.
+     * Continuously retrieves and routes network packets based on routing decisions.
+     *
+     * <p>
+     * This method operates in a loop, fetching packets from the {@link SwarmRouter} and determining
+     * their appropriate destinations. It ensures efficient packet routing by handling each packet
+     * asynchronously and updating relevant routing metrics.
+     * </p>
      */
     private void routePackets() {
+        Thread.currentThread().setName("P2P-PacketRouter");
+        Thread.currentThread().setPriority(Thread.MIN_PRIORITY);
+
+        int emptyCount = 0;
         while (running && !Thread.currentThread().isInterrupted()) {
             try {
                 ByteBuffer packet = router.getNextPacket();
                 if (packet != null) {
                     routePacket(packet);
+                    emptyCount = 0;
                 } else {
-                    // No packets to route, short sleep
-                    Thread.sleep(10);
+                    emptyCount++;
+                    // Exponential backoff with max delay of 1 second
+                    long sleepTime = Math.min(10L * emptyCount, 1000L);
+                    Thread.sleep(sleepTime);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
                 log.error("Error routing packet: {}", e.getMessage());
+                try {
+                    Thread.sleep(100); // Brief pause on error
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
     }
-    
+        private void logThreadState() {
+        Thread currentThread = Thread.currentThread();
+        log.debug("Thread {} (ID: {}) executing, priority: {}", 
+            currentThread.getName(),
+            currentThread.getId(),
+            currentThread.getPriority());
+        
+        // Print stack trace for debugging
+        StackTraceElement[] stackTrace = currentThread.getStackTrace();
+        StringBuilder sb = new StringBuilder();
+        for (StackTraceElement element : stackTrace) {
+            sb.append("\n\tat ").append(element);
+        }
+        log.debug("Stack trace: {}", sb);
+    }
     /**
-     * Routes a single packet by determining its destination and forwarding it through the appropriate peer.
+     * Routes a single network packet to its designated destination.
      *
-     * @param packet The {@link ByteBuffer} containing the raw IP packet data.
+     * <p>
+     * This method parses the incoming packet to determine its destination IP address, retrieves
+     * the next hop using the {@link SwarmRouter}, and forwards the packet through the appropriate
+     * peer's {@link VPNConnection}. It also applies NAT processing and updates routing metrics based
+     * on the packet's transmission.
+     * </p>
+     *
+     * @param packet The {@link ByteBuffer} containing the raw IP packet data to be routed.
      */
     private void routePacket(ByteBuffer packet) {
         try {
@@ -524,10 +744,17 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Processes an incoming packet by determining its destination and forwarding or handling it accordingly.
+     * Processes an incoming network packet from a specific peer.
+     *
+     * <p>
+     * This method analyzes the packet to determine if it is destined for the local network or needs
+     * to be forwarded to another peer. It updates routing metrics based on the packet's source and
+     * destination, and ensures that packets intended for the local subnet are injected into the
+     * virtual network interface.
+     * </p>
      *
      * @param packet      The {@link ByteBuffer} containing the raw IP packet data.
-     * @param sourcePeer  The identifier of the source peer from which the packet was received.
+     * @param sourcePeer  The identifier of the peer from which the packet was received.
      */
     private void processIncomingPacket(ByteBuffer packet, String sourcePeer) {
         try {
@@ -559,6 +786,12 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     /**
      * Updates routing metrics based on the transmission of a packet.
      *
+     * <p>
+     * This method calculates and updates metrics such as latency and bandwidth for the route
+     * through the specified peer. These metrics inform routing decisions and help optimize
+     * packet forwarding within the network.
+     * </p>
+     *
      * @param peerId     The identifier of the peer through which the packet was sent or received.
      * @param packet     The {@link IPPacket} representing the packet.
      * @param packetSize The size of the packet in bytes.
@@ -578,9 +811,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Calculates the estimated bandwidth based on recent packet history.
+     * Estimates the bandwidth for a specific peer based on recent packet transmissions.
      *
-     * @param peer         The {@link Peer} for which bandwidth is being calculated.
+     * <p>
+     * This method calculates the bandwidth by summing the bytes sent and received from the peer
+     * over a defined duration and normalizes it to bytes per second. It provides an estimate of
+     * the current network capacity with the peer.
+     * </p>
+     *
+     * @param peer          The {@link Peer} for which bandwidth is being calculated.
      * @param newPacketSize The size of the new packet in bytes.
      * @return The estimated bandwidth in bytes per second.
      */
@@ -597,10 +836,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Finds a peer by its identifier.
+     * Searches for a peer based on its identifier.
      *
-     * @param peerId The identifier of the peer.
-     * @return The {@link Peer} instance if found; otherwise, {@code null}.
+     * <p>
+     * This method iterates through the list of active peers to find a peer that matches the
+     * provided identifier. It is used to retrieve peer details required for routing decisions.
+     * </p>
+     *
+     * @param peerId The identifier of the peer to find.
+     * @return The {@link Peer} instance if found; {@code null} otherwise.
      */
     private Peer findPeerById(String peerId) {
         for (Peer peer : peers.values()) {
@@ -614,16 +858,28 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     /**
      * Retrieves the local subnet based on the node's IP address.
      *
-     * @return A {@link String} representing the local subnet.
+     * <p>
+     * This method extracts the subnet portion of the node's IP address to determine the range
+     * of IP addresses that are considered part of the local network. It is used for routing
+     * decisions and NAT processing.
+     * </p>
+     *
+     * @return A {@link String} representing the local subnet (e.g., "10.0.0").
      */
     private String getLocalSubnet() {
         return ipAddress.substring(0, ipAddress.lastIndexOf('.'));
     }
     
     /**
-     * Determines whether an IP address belongs to the local network.
+     * Determines whether a given IP address belongs to the local network.
      *
-     * @param ipAddress The IP address to check.
+     * <p>
+     * This method checks if the provided IP address falls within the node's local subnet. It is
+     * used to decide whether to inject packets into the local network interface or to route them
+     * through the P2P network.
+     * </p>
+     *
+     * @param ipAddress The IP address to evaluate.
      * @return {@code true} if the IP address is within the local subnet; {@code false} otherwise.
      */
     private boolean isForLocalNetwork(String ipAddress) {
@@ -633,10 +889,16 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
     
     /**
-     * Performs a handshake with a connected peer by exchanging peer information and proofs of work.
+     * Conducts a handshake with a connected peer to establish a secure communication channel.
+     *
+     * <p>
+     * This method exchanges peer information and proofs of work to authenticate the peer and
+     * validate its legitimacy within the network. It ensures that both parties agree on their
+     * identities and have performed the necessary computational work to participate in the network.
+     * </p>
      *
      * @param conn The {@link VPNConnection} instance representing the connection to the peer.
-     * @throws IOException If the handshake fails due to I/O errors.
+     * @throws IOException If the handshake fails due to I/O errors or invalid data exchange.
      */
     private void performHandshake(VPNConnection conn) throws IOException {
         try {
@@ -666,12 +928,18 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Handles a new peer connection by performing handshake, verifying proof of work, and initializing peer details.
+     * Handles the establishment of a new peer connection by performing handshake procedures and validating proofs of work.
+     *
+     * <p>
+     * This method ensures that the connecting peer is authenticated and meets the network's proof-of-work
+     * requirements. Upon successful validation, it initializes the peer's connection details and integrates
+     * the peer into the network routing mechanisms.
+     * </p>
      *
      * @param address The IP address of the new peer.
      * @param port    The port number of the new peer.
      * @param conn    The {@link VPNConnection} instance representing the connection to the peer.
-     * @throws Exception If there is an error during the handling of the new peer connection.
+     * @throws Exception If there is an error during the handshake or validation process.
      */
     private void handleNewPeerConnection(String address, int port, VPNConnection conn) throws Exception {
         // Wait for peer info and proof
@@ -716,17 +984,23 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
 
 
-      /**
-     * Handles the setup of a new peer connection by initializing a {@link VPNConnection} and assigning handlers.
+    /**
+     * Initializes and sets up a new peer connection from an accepted socket.
      *
-     * @param socket The {@link Socket} representing the new peer connection.
+     * <p>
+     * This method creates a {@link VPNConnection} instance for the newly connected peer, assigns
+     * appropriate handlers, and prepares the connection for data transmission. It ensures that the
+     * peer is integrated into the network's routing and NAT mechanisms.
+     * </p>
+     *
+     * @param socket The {@link Socket} representing the incoming peer connection.
      */
     private void handleNewPeer(Socket socket) {
         try {
             log.info("Setting up new peer connection from: {}", socket.getInetAddress());
             
             // Create VPN connection with handler
-            VPNConnection conn = new VPNConnection(null, port, true); 
+            VPNConnection conn = new VPNConnection(null, port, isInitiator, this.nodeId);
             conn.setGossipHandler(this);
             conn.setConnectionHandler(connectionHandler);  // Add this line
             
@@ -741,7 +1015,12 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Retrieves the {@link UDPHandler} instance from the {@link NetworkStack}.
+     * Retrieves the UDP handler responsible for managing UDP traffic within the network stack.
+     *
+     * <p>
+     * This method provides access to the {@link UDPHandler} instance from the {@link NetworkStack},
+     * allowing for direct manipulation or monitoring of UDP-based VPN traffic.
+     * </p>
      *
      * @return The {@link UDPHandler} associated with this network node.
      */
@@ -750,11 +1029,17 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
 
     /**
-     * Initiates a connection to a new peer given its address and port.
+     * Initiates a connection to a specified peer using its address and port.
+     *
+     * <p>
+     * This method attempts to establish a secure connection to the given peer by creating a {@link VPNConnection}.
+     * It employs an exponential backoff strategy for connection retries and respects the maximum peer limit.
+     * Upon successful connection, the peer is integrated into the network's routing and NAT systems.
+     * </p>
      *
      * @param address The IP address of the peer to connect to.
      * @param port    The port number of the peer to connect to.
-     * @throws IOException If the connection attempt fails after the maximum number of retries.
+     * @throws IOException If the connection attempt fails after exhausting all retry attempts.
      */
     public void connectToPeer(String address, int port) throws IOException {
         String peerAddr = address + ":" + port;
@@ -778,8 +1063,8 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
                 log.info("Connecting to peer {}:{} (attempt {}/{}) with timeout {}ms",
                         address, port, attempt, maxAttempts, currentTimeout);
     
-                // Create connection
-                VPNConnection conn = new VPNConnection(address, port);
+                // Create connection with pow instance
+                VPNConnection conn = new VPNConnection(address, port, isInitiator, nodeId, pow);
                 conn.setTimeout(currentTimeout); 
                 conn.setGossipHandler(this);
     
@@ -838,7 +1123,14 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Handles the traffic from a connected peer by continuously receiving packets and processing them.
+     * Manages the data traffic from a connected peer by continuously receiving and processing packets.
+     *
+     * <p>
+     * This method runs in a separate thread, listening for incoming VPN packets from the specified peer.
+     * It updates latency metrics based on packet reception times and delegates packet processing to
+     * the {@link #processIncomingPacket(ByteBuffer, String)} method. If the connection is disrupted,
+     * the peer is removed from the network.
+     * </p>
      *
      * @param peer The {@link Peer} instance representing the connected peer.
      */
@@ -877,9 +1169,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Sends the initial routing information to a newly connected peer.
+     * Sends the initial routing information to a newly connected peer to establish routing pathways.
      *
-     * @param peer The {@link Peer} instance representing the new peer.
+     * <p>
+     * This method prepares and transmits the current routing table and peer information to the specified
+     * peer using gossip messages. It ensures that both nodes have a consistent view of the network's routing
+     * state, facilitating efficient packet forwarding and network synchronization.
+     * </p>
+     *
+     * @param peer The {@link Peer} instance representing the newly connected peer.
      * @throws IOException If there is an error while sending routing information.
      */
     private void sendInitialRoutes(Peer peer) throws IOException {
@@ -937,9 +1235,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Removes a peer from the network by updating the peers map, router, and cleaning up resources.
+     * Removes a peer from the network, updating routing tables and cleaning up associated resources.
      *
-     * @param peer The {@link Peer} instance to be removed.
+     * <p>
+     * This method deregisters the peer from the active peers list, removes any associated routes
+     * from the {@link SwarmRouter}, and closes the peer's {@link VPNConnection}. It also cleans up
+     * traffic statistics related to the peer and triggers peer count checks to maintain network health.
+     * </p>
+     *
+     * @param peer The {@link Peer} instance to be removed from the network.
      */
     private void removePeer(Peer peer) {
         log.info("Removing peer: {}", peer.getAddress());
@@ -963,19 +1267,32 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Ensures that the network maintains at least the minimum required number of peers.
-     * If the current peer count is below the minimum, it initiates a search for new peers.
+     * Verifies that the network maintains the minimum required number of active peers.
+     *
+     * <p>
+     * If the current peer count falls below the defined minimum, this method initiates a bootstrap
+     * process to discover and connect to new peers, ensuring network robustness and reliability.
+     * </p>
      */
     private void checkPeerCount() {
-        if (peers.size() < MIN_PEERS) {
-            log.info("Peer count ({}) below minimum ({}), seeking new peers", 
-                peers.size(), MIN_PEERS);
-            seekNewPeers();
+        if (peers.size() < MIN_PEERS || peerDiscovery.needsBootstrap()) {
+            try {
+                Set<InetSocketAddress> newPeers = peerDiscovery.bootstrap();
+                connectToInitialPeers(newPeers);
+            } catch (IOException e) {
+                log.warn("Failed to bootstrap new peers: {}", e.getMessage());
+            }
         }
     }
     
     /**
-     * Seeks new peers by requesting peer lists from existing connections through gossip messages.
+     * Initiates a search for new peers by requesting peer lists from existing connections.
+     *
+     * <p>
+     * This method broadcasts peer discovery requests to currently connected peers via gossip messages,
+     * allowing the node to expand its peer list and reinforce network connectivity. It ensures that
+     * the network remains decentralized and resilient against peer disconnections.
+     * </p>
      */
     private void seekNewPeers() {
         // Get list of known peers from existing connections
@@ -1003,7 +1320,13 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
 
     /**
-     * Periodically gossips to maintain network state by sharing routing information and known peers with a subset of connected peers.
+     * Executes the gossip protocol to share routing information and known peers with a subset of connected peers.
+     *
+     * <p>
+     * This method selects a random subset of active peers and transmits the current network state,
+     * including routing tables and peer lists. Gossiping helps in disseminating network information
+     * efficiently, aiding in peer discovery and maintaining synchronized routing paths across the network.
+     * </p>
      */
     private void gossip() {
         if (!running || peers.isEmpty()) return;
@@ -1062,8 +1385,14 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
 
 
-     /**
-     * Handles incoming gossip messages by validating them and updating network state accordingly.
+    /**
+     * Processes an incoming gossip message by updating routing tables and discovering new peers.
+     *
+     * <p>
+     * This method validates the received gossip message and integrates any new routing information
+     * or peer data into the network. It ensures that the node's routing decisions are informed by
+     * the collective knowledge of connected peers, enhancing network efficiency and connectivity.
+     * </p>
      *
      * @param message     The {@link GossipMessage} received from a peer.
      * @param sourcePeer  The {@link Peer} instance representing the source of the gossip message.
@@ -1138,8 +1467,13 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Updates the proof of work by solving a new proof and broadcasting it to all connected peers.
-     * This method is scheduled to run periodically.
+     * Updates the proof of work by generating a new proof and broadcasting it to all connected peers.
+     *
+     * <p>
+     * This method periodically solves a new proof of work to maintain the node's authenticated status
+     * within the network. Upon successfully generating a new proof, it disseminates the proof to all
+     * peers via gossip messages, ensuring that the network acknowledges the node's ongoing participation.
+     * </p>
      */
     private void updateProofOfWork() {
         executor.submit(() -> {
@@ -1167,8 +1501,13 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Sends keepalive messages to all connected peers to ensure active connections and detect stale peers.
-     * This method is scheduled to run periodically.
+     * Sends keepalive messages to all connected peers to maintain active connections and detect inactive peers.
+     *
+     * <p>
+     * This method periodically transmits ping messages to each peer, signaling the node's continued presence
+     * within the network. Receiving acknowledgments from peers confirms active connections, while missing responses
+     * may indicate stale or disconnected peers, prompting their removal from the network.
+     * </p>
      */
     private void sendKeepalive() {
         if (!running) return;
@@ -1189,8 +1528,13 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Checks the health of all connected peers and removes any that are deemed stale.
-     * This method is scheduled to run periodically.
+     * Evaluates the health of all connected peers and removes any that are deemed stale or unresponsive.
+     *
+     * <p>
+     * This method iterates through the list of active peers, checking metrics such as last seen timestamps
+     * and latency. Peers that have not communicated within a defined threshold or exhibit poor performance
+     * are removed to maintain network integrity and performance.
+     * </p>
      */
     private void checkPeerHealth() {
         if (!running || peers.isEmpty()) return;
@@ -1219,19 +1563,30 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Retrieves the subnet for a given IP address.
+     * Determines the subnet for a given IP address.
+     *
+     * <p>
+     * This method extracts the subnet portion from the provided IP address, facilitating routing
+     * decisions and network segmentation. It assumes a standard IPv4 address format.
+     * </p>
      *
      * @param ipAddress The IP address for which the subnet is to be determined.
-     * @return A {@link String} representing the subnet in CIDR notation.
+     * @return A {@link String} representing the subnet in CIDR notation (e.g., "10.0.0.0/24").
      */
     private String getSubnetForIP(String ipAddress) {
         return ipAddress.substring(0, ipAddress.lastIndexOf('.')) + ".0/24";
     }
     
     /**
-     * Formats network statistics into a human-readable map.
+     * Aggregates and retrieves comprehensive network statistics.
      *
-     * @return A {@link Map} containing various network statistics and metrics.
+     * <p>
+     * This method compiles various metrics such as active peers, traffic statistics, latency,
+     * bandwidth estimates, routing information, proof of work status, and NAT mappings. The
+     * returned data is suitable for monitoring tools, dashboards, or diagnostic purposes.
+     * </p>
+     *
+     * @return A {@link Map} containing key-value pairs of network statistics and metrics.
      */
     public Map<String, Object> getNetworkStats() {
         Map<String, Object> stats = new HashMap<>();
@@ -1289,9 +1644,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Retrieves detailed information about all connected peers.
+     * Retrieves detailed information about all active peers in the network.
      *
-     * @return A {@link List} of {@link Map} objects, each containing details of a peer.
+     * <p>
+     * This method collects and formats data such as each peer's address, port, node ID, latency,
+     * bandwidth usage, traffic statistics, last seen timestamp, and routing scores. The information
+     * is structured in a list of maps for easy consumption by external systems or for display purposes.
+     * </p>
+     *
+     * @return A {@link List} of {@link Map} objects, each containing detailed attributes of a peer.
      */
     public List<Map<String, Object>> getPeerDetails() {
         List<Map<String, Object>> peerList = new ArrayList<>();
@@ -1314,9 +1675,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Generates a string representation of the current routing table for visualization and diagnostics.
+     * Generates a comprehensive string representation of the current routing table.
      *
-     * @return A {@link String} detailing the current routing table.
+     * <p>
+     * This method iterates through all active routes, detailing each destination, the next hop,
+     * hop count, pheromone score, latency, and bandwidth. The output is formatted for readability,
+     * making it useful for diagnostics and network monitoring.
+     * </p>
+     *
+     * @return A {@link String} containing the formatted routing table information.
      */
     public String dumpRoutingTable() {
         StringBuilder dump = new StringBuilder();
@@ -1345,9 +1712,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
 
 
-     /**
+    /**
      * Logs periodic network statistics to aid in monitoring and diagnostics.
-     * This method is scheduled to run at fixed intervals.
+     *
+     * <p>
+     * This method gathers current network metrics and outputs them to the logging system at
+     * regular intervals. It includes information such as peer counts, traffic volumes, latency,
+     * bandwidth, routing details, and proof of work status. These logs are instrumental in
+     * assessing the network's health and performance over time.
+     * </p>
      */
     private void logStats() {
         if (!running) return;
@@ -1366,10 +1739,16 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Formats a byte count into a human-readable string with appropriate units.
+     * Converts a byte count into a human-readable string with appropriate units.
      *
-     * @param bytes The number of bytes.
-     * @return A {@link String} representing the formatted byte count.
+     * <p>
+     * This utility method formats large byte values into kilobytes (KB), megabytes (MB),
+     * gigabytes (GB), etc., enhancing the readability of traffic statistics and other
+     * byte-based metrics.
+     * </p>
+     *
+     * @param bytes The number of bytes to format.
+     * @return A {@link String} representing the formatted byte count with units.
      */
     private String formatBytes(long bytes) {
         if (bytes < 1024) return bytes + " B";
@@ -1379,9 +1758,14 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Retrieves a list of all active peers in a formatted string representation.
+     * Retrieves a list of all active peers in the network in a formatted string representation.
      *
-     * @return A {@link List} of {@link String} objects, each representing an active peer.
+     * <p>
+     * This method compiles a list of peer addresses along with their corresponding ports and
+     * cumulative traffic statistics. The output is structured for easy display or logging.
+     * </p>
+     *
+     * @return A {@link List} of {@link String} objects, each representing an active peer and its traffic.
      */
     public List<String> getPeerList() {
         List<String> peerList = new ArrayList<>();
@@ -1397,8 +1781,14 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Determines whether the network is healthy based on various criteria such as running status,
-     * peer count, proof of work freshness, active routes, and peer health metrics.
+     * Evaluates the overall health of the network node based on various criteria.
+     *
+     * <p>
+     * This method assesses multiple aspects such as the node's running status, peer count,
+     * proof of work freshness, active routing paths, and the health metrics of connected peers.
+     * It returns {@code true} if the network meets all health criteria, indicating optimal operation.
+     * Otherwise, it returns {@code false}, signaling potential issues that may require attention.
+     * </p>
      *
      * @return {@code true} if the network is healthy; {@code false} otherwise.
      */
@@ -1423,9 +1813,16 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Adds a callback function that receives network statistics at regular intervals.
+     * Registers a callback function to receive periodic network statistics updates.
      *
-     * @param callback A {@link Consumer} that processes the network statistics map.
+     * <p>
+     * This method allows external components or monitoring tools to receive real-time network
+     * statistics by providing a {@link Consumer} that processes the statistics map. The callback
+     * is invoked at fixed intervals, enabling continuous monitoring and dynamic responses based
+     * on network performance.
+     * </p>
+     *
+     * @param callback A {@link Consumer} that accepts a {@link Map} of network statistics.
      */
     public void addStatsCallback(Consumer<Map<String, Object>> callback) {
         scheduler.scheduleAtFixedRate(() -> {
@@ -1438,8 +1835,18 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
 
     /**
-     * Cleans up and shuts down the network node gracefully by notifying peers, shutting down thread pools,
-     * and clearing all internal data structures.
+     * Gracefully shuts down the P2P network node by notifying peers, terminating threads, and releasing resources.
+     *
+     * <p>
+     * This method performs the following actions to ensure a clean shutdown:
+     * <ul>
+     *   <li>Sets the running flag to {@code false} to signal all threads to terminate.</li>
+     *   <li>Notifies all connected peers of the shutdown by sending a ping message with a specific payload.</li>
+     *   <li>Closes the server socket and shuts down scheduled and executor thread pools.</li>
+     *   <li>Removes all active peers from the network, ensuring that routing tables and statistics are cleared.</li>
+     *   <li>Logs the shutdown process to aid in monitoring and debugging.</li>
+     * </ul>
+     * </p>
      */
     @Override
     public void close() {
@@ -1495,9 +1902,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Exports the current network state for persistence or transfer purposes.
+     * Serializes and exports the current network state for persistence or transfer purposes.
      *
-     * @return A {@link Map} representing the serialized state of the network.
+     * <p>
+     * This method gathers essential network information, including node identifiers, IP addresses,
+     * ports, proof of work data, known peers, and active routes. The serialized state can be used
+     * to restore the network node's configuration or migrate it to a different environment.
+     * </p>
+     *
+     * @return A {@link Map} containing key-value pairs representing the network's serialized state.
      */
     public Map<String, Object> exportState() {
         Map<String, Object> state = new HashMap<>();
@@ -1531,18 +1944,24 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Imports network state from a serialized map, allowing the network node to restore its previous state.
+     * Imports and restores the network state from a serialized map.
      *
-     * @param state A {@link Map} containing the serialized network state.
+     * <p>
+     * This static method reconstructs a {@link P2PNetwork} instance based on the provided serialized
+     * state. It initializes network configurations, reconnects to known peers, and restores routing
+     * tables to reestablish the network node's previous operational state.
+     * </p>
+     *
+     * @param state A {@link Map} containing the serialized network state to import.
      * @return A new {@link P2PNetwork} instance initialized with the imported state.
-     * @throws IOException If there is an error during state import.
+     * @throws IOException If there is an error during the state import process.
      */
     public static P2PNetwork importState(Map<String, Object> state) throws IOException {
         int port = (Integer) state.get("port");
         String ipAddress = (String) state.get("ipAddress");
         boolean isInitiator = ipAddress.equals("10.0.0.1");
         
-        P2PNetwork network = new P2PNetwork(port, isInitiator);
+        P2PNetwork network = new P2PNetwork(port, isInitiator, ipAddress);
         
         // Connect to known peers
         @SuppressWarnings("unchecked")
@@ -1561,10 +1980,16 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Runs a comprehensive diagnostic report of the network node, including peer status, network metrics,
-     * routing information, and security status.
+     * Generates a comprehensive diagnostic report of the network node.
      *
-     * @return A {@link String} containing the diagnostic report.
+     * <p>
+     * This method compiles detailed information about the node's current status, including peer health,
+     * network metrics, routing tables, security status, and overall network integrity. The diagnostic
+     * report is formatted as a human-readable string, making it suitable for logging, monitoring, and
+     * troubleshooting purposes.
+     * </p>
+     *
+     * @return A {@link String} containing the formatted diagnostic report of the network node.
      */
     public String runDiagnostics() {
         StringBuilder report = new StringBuilder();
@@ -1646,9 +2071,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
 
     /**
-     * Tests the local network connectivity by attempting to bind to the node's port.
+     * Tests the local network connectivity by attempting to bind to the node's designated port.
      *
-     * @return {@code true} if the port is available and can be bound; {@code false} otherwise.
+     * <p>
+     * This method verifies whether the specified port is available and can be successfully bound,
+     * ensuring that the node can listen for incoming peer connections. It is useful for diagnosing
+     * network configuration issues and verifying that the node is ready to operate within the network.
+     * </p>
+     *
+     * @return {@code true} if the port is available and the node can bind to it; {@code false} otherwise.
      */
     public boolean testConnectivity() {
         // Test if we can bind to our port
@@ -1663,7 +2094,13 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Provides a string representation of the network node's current status.
+     * Provides a concise string representation of the P2P network node's current status.
+     *
+     * <p>
+     * This method formats essential information such as the node's identifier, IP address, port,
+     * active peer count, and routing table size into a single string. It is useful for logging and
+     * quick status checks.
+     * </p>
      *
      * @return A {@link String} summarizing the node's ID, address, port, number of peers, and routes.
      */
@@ -1679,9 +2116,15 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
 
     
     /**
-     * Handles incoming gossip messages by validating and processing them.
+     * Processes an incoming gossip message by validating and updating network routing and peer information.
      *
-     * @param message The {@link GossipMessage} received.
+     * <p>
+     * This method implements the {@link GossipMessage.GossipHandler} interface, allowing the node to
+     * react to gossip messages received from peers. It ensures that only valid gossip messages are
+     * processed and integrates new routing information and peer data to maintain an up-to-date network state.
+     * </p>
+     *
+     * @param message The {@link GossipMessage} received from a peer.
      */
     @Override
     public void handleGossip(GossipMessage message) {
@@ -1693,10 +2136,16 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Handles incoming proof of work messages by updating peers with newer proofs.
+     * Handles an incoming proof of work message by updating the peer's proof and timestamp.
      *
-     * @param proof     The proof of work data received.
-     * @param timestamp The timestamp associated with the proof of work.
+     * <p>
+     * This method implements the proof handling mechanism to ensure that peers maintain valid and
+     * up-to-date proofs of work. It verifies the received proof against the node's criteria and updates
+     * the peer's proof information accordingly.
+     * </p>
+     *
+     * @param proof     The byte array containing the proof of work data received from the peer.
+     * @param timestamp The timestamp associated with the received proof of work.
      */
     @Override 
     public void handleProof(byte[] proof, long timestamp) {
@@ -1710,7 +2159,13 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
     }
     
     /**
-     * Handles incoming peer information messages by updating the last seen timestamp for the peer.
+     * Updates the last seen timestamp for a peer based on received peer information.
+     *
+     * <p>
+     * This method implements the peer information handling to track active peers within the network.
+     * It updates the last seen timestamp to reflect recent communication, aiding in peer health assessment
+     * and routing decisions.
+     * </p>
      *
      * @param nodeId The node ID of the peer that sent the information.
      */

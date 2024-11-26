@@ -24,8 +24,17 @@ import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import org.publiuspseudis.esadvpn.crypto.ProofOfWork;
 import org.publiuspseudis.esadvpn.network.P2PNetwork;
 import org.publiuspseudis.esadvpn.crypto.SecureChannel;
 import org.publiuspseudis.esadvpn.protocol.NetworkProtocolHandler;
@@ -106,8 +115,29 @@ import org.slf4j.LoggerFactory;
  * Publius Pseudis
  */
 public final class VPNConnection implements NetworkProtocolHandler, AutoCloseable {
-    
+    /**
+     * Unique identifier for this VPN node.
+     * Used to distinguish between different nodes within the P2P network.
+     */
+    private final byte[] nodeId; // Unique ID for the node
 
+    /**
+     * Instance of {@link ProofOfWork} used to validate network activities.
+     * Ensures that peers perform computational work to prevent spam or malicious behavior.
+     */
+    private final ProofOfWork pow; // Proof of Work instance
+
+    /**
+     * Atomic flag indicating whether the listener thread is actively processing incoming packets.
+     * Ensures thread-safe updates to the listener's active state.
+     */
+    private final AtomicBoolean listenerActive = new AtomicBoolean(false);
+
+    /**
+     * Latch used to signal when the listener thread is ready to receive packets.
+     * Ensures that initialization processes wait until the listener is fully operational.
+     */
+    private final CountDownLatch listenerReady = new CountDownLatch(1);
     
     /**
      * Sets the connection handler responsible for managing new peer connections.
@@ -175,6 +205,20 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
     // =====================
     // Message Types
     // =====================
+
+     /**
+     * Message type identifier for echo request messages.
+     * Used during connectivity tests to verify UDP communication between peers.
+     */
+    public static final byte ECHO_REQUEST = 0x01;
+
+    /**
+     * Message type identifier for echo response messages.
+     * Sent in reply to {@code ECHO_REQUEST} messages to confirm successful UDP communication.
+     */
+    public static final byte ECHO_RESPONSE = 0x2;
+
+    
     
     /**
      * Message type identifier for data packets.
@@ -210,8 +254,8 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
      * Special message type identifier for echo tests.
      * Utilized during connectivity tests to verify UDP communication between peers.
      */
-    private static final byte MSG_TYPE_ECHO = 0x7F;  // Special test message type
-
+    private static final byte MSG_TYPE_ECHO = 0x06;  // Special test message type
+    public static final byte MSG_TYPE_VERIFY = 0x07;  // Verification request
     // =====================
     // Network Constants
     // =====================
@@ -239,6 +283,24 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
      * Balances memory usage and the ability to handle large packets.
      */
     private static final int BUFFER_SIZE = 16384;      // Read buffer size
+    
+    
+    /**
+     * Mapping of message type identifiers to their corresponding human-readable names.
+     * Facilitates logging and debugging by providing meaningful names for message types.
+     */
+    private final Map<Byte, String> MESSAGE_TYPE_NAMES = new HashMap<>() {{
+        put(MSG_TYPE_DATA, "DATA");
+        put(MSG_TYPE_GOSSIP, "GOSSIP");
+        put(MSG_TYPE_PROOF, "PROOF");
+        put(MSG_TYPE_PEER_INFO, "PEER_INFO");
+        put(MSG_TYPE_PING, "PING");
+        put(MSG_TYPE_ECHO, "ECHO");
+        put(MSG_TYPE_VERIFY, "VERIFY");
+    }};
+
+
+    
     
     // =====================
     // Connection Components
@@ -349,75 +411,103 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
     /**
      * Establishes a connection to a specified peer within the P2P VPN network.
      *
-     * @param peerHost  The hostname or IP address of the peer to connect to.
-     * @param peerPort  The port number on which the peer is listening.
-     * @param isServer  Indicates whether the connection is being established as a server.
+     * @param bindAddress
+     * @param port  The port number on which the peer is listening.
+     * @param isInitiator  Indicates whether the connection is being established as a server.
+     * @param nodeId node id
+     * @param pow instance of proof of work
      * @throws java.lang.Exception If an error occurs while attempting to connect to the peer.
      */
-    public VPNConnection(String peerHost, int peerPort, boolean isServer) throws Exception {
-        this.isServer = isServer;
+    public VPNConnection(String bindAddress, int port, boolean isInitiator, byte[] nodeId, ProofOfWork pow) throws Exception {
+        if (nodeId == null) {
+            throw new IllegalArgumentException("nodeId cannot be null");
+        }
+        this.nodeId = nodeId;
+        this.pow = (pow != null) ? pow : new ProofOfWork(nodeId);
+        this.isServer = isInitiator;
         setRunning(true);
         this.currentPhase = ConnectionPhase.INITIAL;
 
+        // Initialize crypto and metrics first
+        this.crypto = new SecureChannel();
+        this.bytesSent = new AtomicLong(0);
+        this.bytesReceived = new AtomicLong(0);
+        this.lastLatency = Double.MAX_VALUE;
+        this.lastBandwidthEstimate = 0;
+        this.lastStatsReset = System.currentTimeMillis();
+        this.lastReceivedTime = System.currentTimeMillis();
+
         try {
-            // Create unbound socket
+            // Create socket
             this.socket = new DatagramSocket(null);
             this.socket.setReuseAddress(true);
-            if(isServer) {
-                this.socket.setSoTimeout(1000);
-            } else {
-                this.socket.setSoTimeout(SOCKET_TIMEOUT);
-            }
-            testUDPSocket();  // Initial test
+            this.socket.setSoTimeout(isServer ? SOCKET_TIMEOUT : 1000);
 
-            // Optional performance settings
+            // Set up socket options
             try {
                 this.socket.setTrafficClass(0x2E);
                 this.socket.setReceiveBufferSize(BUFFER_SIZE);
                 this.socket.setSendBufferSize(BUFFER_SIZE);
-                log.debug("Set socket buffer sizes: send={}, receive={}", 
-                    socket.getSendBufferSize(), socket.getReceiveBufferSize());
             } catch (SocketException e) {
                 log.warn("Could not set socket performance parameters: {}", e.getMessage());
             }
 
-            // Initialize other fields before binding
-            this.crypto = new SecureChannel();
-            this.bytesSent = new AtomicLong(0);
-            this.bytesReceived = new AtomicLong(0);
-            this.lastLatency = Double.MAX_VALUE;
-            this.lastBandwidthEstimate = 0;
-            this.lastStatsReset = System.currentTimeMillis();
-            this.lastReceivedTime = System.currentTimeMillis();
+            // If we're a client connecting to a peer, use our own port for binding
+            if (!isInitiator) {
+                // Store peer address for later use
+                this.peerAddress = new InetSocketAddress(bindAddress, port);
 
-            // Bind socket
-            if (isServer) {
-                InetSocketAddress bindAddr = new InetSocketAddress("0.0.0.0", peerPort);
-                log.info("Server binding to {}", bindAddr);
+                // For the client, bind to any available port
+                InetSocketAddress bindAddr = new InetSocketAddress(
+                    "0.0.0.0",  // Bind to all interfaces
+                    0  // Let the system assign an available port
+                );
+
+                log.info("Client binding to {}", bindAddr);
                 this.socket.bind(bindAddr);
-                this.peerAddress = null;
+                log.info("Client assigned port: {}", socket.getLocalPort());
 
-                startServerListener();  // Start listener after binding
-                log.info("Server listener started on port {}", peerPort);
-            } else {
-                log.info("Client binding to random port");
-                this.socket.bind(new InetSocketAddress(0));
-                this.peerAddress = new InetSocketAddress(peerHost, peerPort);
-                log.info("Client connecting to {}", peerAddress);
-
-                // Client mode - run connectivity test
+                // Perform connection steps
+                testUDPSocket();
                 echoTest();
                 performHandshake();
+            } else {
+                // Server mode - bind to specified port
+                InetSocketAddress bindAddr = new InetSocketAddress(
+                    "0.0.0.0",  // Bind to all interfaces
+                    port
+                );
+
+                log.info("Server binding to {}", bindAddr);
+                this.socket.bind(bindAddr);
+
+                testUDPSocket();
+                startServerListener();
             }
+
+            log.debug("Set socket buffer sizes: send={}, receive={}",
+                socket.getSendBufferSize(), socket.getReceiveBufferSize());
+
         } catch (Exception e) {
             log.error("VPNConnection initialization failed: {}", e.getMessage(), e);
-             setRunning(false); // Make sure we're marked as not running
+            setRunning(false);
             if (socket != null) {
                 socket.close();
             }
             throw e;
         }
     }
+    
+    /**
+    * Performs a basic test of the UDP socket by sending a test packet if acting as a client
+    * and logs the socket's configuration details.
+    *
+    * <p>
+    * This method is used during initialization to ensure that the socket is properly bound
+    * and capable of sending packets. It sends a test packet to the peer if the connection
+    * is not in server mode.
+    * </p>
+    */
     private void testUDPSocket() {
         try {
             String msg = isServer ? "Server socket test" : "Client socket test";
@@ -452,101 +542,147 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
     }
 
     /**
-     * Starts the server listener thread to handle incoming UDP packets.
+     * Initializes and starts the server listener thread to handle incoming UDP packets.
+     *
+     * <p>
+     * This method sets up a dedicated listener thread that continuously listens for incoming
+     * UDP packets from peers. It processes different message types based on the current connection
+     * phase and delegates handling to appropriate methods.
+     * </p>
+     *
+     * @throws IOException If an error occurs while binding the socket or starting the listener.
      */
-    private void startServerListener() {
+    private void startServerListener() throws IOException {
         if (!isServer) return;
 
         listenerThread = new Thread(() -> {
-            log.debug("[UDP-Listener] Server listener started on port {}", socket.getLocalPort());
+            log.debug("[UDP-Listener] Server listener starting on port {}", socket.getLocalPort());
+            listenerActive.set(true);
             byte[] buffer = new byte[MAX_PACKET_SIZE];
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
 
-            while (running) {
-               try {
-                   socket.receive(packet);
-                   if (packet.getLength() > 0) {
-                       ByteBuffer msg = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
-                       byte type = msg.get();
-                       InetSocketAddress addr = (InetSocketAddress) packet.getSocketAddress();
+            try {
+                // Signal that we're ready to receive
+                listenerReady.countDown();
 
-                       log.debug("[UDP-Listener] Received message type {} size {} from {}", 
-                           type, packet.getLength(), addr);
+                while (running && listenerActive.get()) {
+                    try {
+                        socket.receive(packet);
 
-                       // Handle echo requests immediately regardless of state
-                       if (type == MSG_TYPE_ECHO) {
-                           handleEchoPacket(packet);
-                           continue;
-                       }
+                        if (packet.getLength() > 0) {
+                            ByteBuffer msg = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
+                            byte type = msg.get();
 
-                       // Check for connection from new peer
-                       if (!addr.equals(peerAddress)) {
-                           log.debug("[UDP-Listener] New peer connection from: {}", addr);
-                           currentPhase = ConnectionPhase.INITIAL;
-                           peerAddress = null;  // Clear existing peer
-                       }
+                            log.debug("[UDP-Listener] Received message type {} size {} from {}", 
+                                type, packet.getLength(), packet.getSocketAddress());
 
-                       switch (currentPhase) {
-                           case INITIAL, UDP_VERIFIED -> {
-                               if (type == MSG_TYPE_PEER_INFO) {
-                                   peerAddress = addr;
-                                   log.debug("[UDP-Listener] Processing peer info from: {}", addr);
-                                   storePacket(packet);
-                                   performServerHandshake();
-                                   currentPhase = ConnectionPhase.SECURE_CHANNEL_ESTABLISHED;
-                                   if (connectionHandler != null) {
-                                       connectionHandler.onNewConnection(
-                                           addr.getHostString(), 
-                                           addr.getPort(), 
-                                           this
-                                       );
-                                   }
-                               }
-                           }
-                           case SECURE_CHANNEL_ESTABLISHED, NETWORK_HANDSHAKE_COMPLETE -> {
-                               if (crypto.isEstablished()) {
-                                   log.debug("[UDP-Listener] Processing established channel message type {} from {}", 
-                                       type, addr);
-                                   handleControlMessage(type, msg);
-                               } else {
-                                   log.warn("[UDP-Listener] Received message type {} but channel not established", type);
-                               }
-                           }
-                       }
-                   }
-               } catch (SocketTimeoutException e) {
-                   // Normal timeout
-               } catch (IOException e) {
-                   if (running) {
-                       log.error("[UDP-Listener] Error in server listener: {}", e.getMessage());
-                   }
-               } catch (Exception e) {
-                   log.error("[UDP-Listener] Error handling packet: {}", e.getMessage(), e);
-               }
-           }
-            log.debug("[UDP-Listener] Server listener stopped cleanly");
-        }, "UDP-Listener");
+                            // Handle verification request immediately
+                            if (type == 0x01) {
+                                handleFirstMessage(packet);
+                                continue;
+                            }
+
+                            // Handle echo requests immediately regardless of state
+                            if (type == MSG_TYPE_ECHO) {
+                                handleEchoPacket(packet);
+                                continue;
+                            }
+
+                            // Check for connection from new peer
+                            if (!packet.getSocketAddress().equals(peerAddress)) {
+                                log.debug("[UDP-Listener] New peer connection from: {}", packet.getSocketAddress());
+                                currentPhase = ConnectionPhase.INITIAL;
+                                peerAddress = null;  // Clear existing peer
+                            }
+
+                            handleBasedOnPhase(packet, msg, type);
+                        }
+
+                    } catch (SocketTimeoutException e) {
+                        // Normal timeout, continue
+                    } catch (IOException e) {
+                        if (running && listenerActive.get()) {
+                            log.error("[UDP-Listener] Error in server listener: {}", e.getMessage());
+                        }
+                    }
+                }
+            } finally {
+                listenerActive.set(false);
+            }
+                log.debug("[UDP-Listener] Server listener stopped cleanly");
+            }, "UDP-Listener");
 
         listenerThread.setDaemon(true);
         listenerThread.start();
+
+        // Wait for listener to be ready
+        try {
+            if (!listenerReady.await(5, TimeUnit.SECONDS)) {
+                throw new IOException("UDP listener failed to initialize");
+            }
+            log.info("Server listener started on port {}", socket.getLocalPort());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for listener to start", e);
+        }
     }
 
     /**
-     * Handles an echo packet by sending an echo response back to the sender.
+     * Processes an incoming echo packet by sending an appropriate echo response.
+     *
+     * <p>
+     * This method handles {@code ECHO_REQUEST} messages by extracting the random data payload
+     * and sending back an {@code ECHO_RESPONSE} with the same data. It ensures that echo
+     * tests confirm successful UDP communication between peers.
+     * </p>
      *
      * @param packet The received {@link DatagramPacket} containing the echo request.
      * @throws IOException If an error occurs while sending the echo response.
      */
-    private void handleEchoPacket(DatagramPacket packet) throws IOException{
-        log.debug("[UDP-Listener] Received echo request from {}", packet.getSocketAddress());
-        DatagramPacket response = new DatagramPacket(
-            packet.getData(), 
-            packet.getLength(), 
-            packet.getSocketAddress()
-        );
-        socket.send(response);
-        log.debug("[UDP-Listener] Sent echo response to {}", packet.getSocketAddress());
+    private void handleEchoPacket(DatagramPacket packet) throws IOException {
+        if (packet.getLength() < 2) {
+            log.debug("Echo packet too short, ignoring");
+            return;
+        }
+
+        log.debug("Handling echo packet from {}, length: {}", 
+            packet.getSocketAddress(), packet.getLength());
+
+        ByteBuffer msg = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
+        byte type = msg.get();
+        byte subtype = msg.get();
+
+        log.debug("Echo packet type: {}, subtype: {}", type, subtype);
+
+        if (type == MSG_TYPE_ECHO && subtype == ECHO_REQUEST) {
+            // Copy just the random data portion
+            byte[] randomData = new byte[msg.remaining()];
+            msg.get(randomData);
+
+            ByteBuffer response = ByteBuffer.allocate(randomData.length + 2);
+            response.put(MSG_TYPE_ECHO);
+            response.put(ECHO_RESPONSE);  // Make sure this is 0x02
+            response.put(randomData);
+            response.flip();
+
+            log.debug("Sending echo response with {} bytes of random data to {}", 
+                randomData.length, packet.getSocketAddress());
+
+            DatagramPacket responsePacket = new DatagramPacket(
+                response.array(),
+                response.limit(),
+                packet.getAddress(),
+                packet.getPort()
+            );
+            socket.send(responsePacket);
+        } else {
+            log.debug("Ignoring non-request echo packet (type: {}, subtype: {})", 
+                type, subtype);
+        }
     }
+
+
+
      /**
      * Performs the server-side handshake by exchanging public keys and establishing a secure channel.
      *
@@ -598,35 +734,100 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
      *
      * @throws IOException If the echo test fails due to no response or network issues.
      */
-    private void echoTest() throws IOException {
-        if (isServer) {
-            // Server no longer needs to handle echo test directly
-            return;
-        }
+ 
+private void echoTest() throws IOException, InterruptedException {
+    if (isServer || handshakeCompleted) return;
 
-        // Client mode - send echo request
-        byte[] data = new byte[8];
-        new SecureRandom().nextBytes(data);
-        ByteBuffer message = ByteBuffer.allocate(9); // 1 byte type + 8 bytes data
-        message.put(MSG_TYPE_ECHO);
-        message.put(data);
-        message.flip();
+    // Create echo request with random data
+    byte[] randomData = new byte[8];
+    new SecureRandom().nextBytes(randomData);
+    
+    // Add echo message type byte and request subtype
+    ByteBuffer message = ByteBuffer.allocate(10);
+    message.put(MSG_TYPE_ECHO);
+    message.put(ECHO_REQUEST);
+    message.put(randomData);
+    message.flip();
 
-        DatagramPacket packet = new DatagramPacket(message.array(), message.limit(), peerAddress);
-        log.debug("Client sending echo test to {}", peerAddress);
-        socket.send(packet);
+    byte[] requestPacket = message.array();
+    DatagramPacket packet = new DatagramPacket(
+        requestPacket, 
+        requestPacket.length, 
+        peerAddress
+    );
 
-        socket.setSoTimeout(1000); // Short timeout for test
+    int maxAttempts = 3;
+    int attemptDelay = 1000; // 1 second between attempts
+
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            socket.receive(packet);
-            log.debug("Client received echo response from {}", packet.getSocketAddress());
-        } catch (IOException e) {
-            log.error("Echo test failed on client: {}", e.getMessage());
-            throw new IOException("UDP connectivity test failed - server not responding");
-        } finally {
-            socket.setSoTimeout(SOCKET_TIMEOUT);
+            log.debug("Client sending echo test to {} (attempt {}/{})", 
+                peerAddress, attempt, maxAttempts);
+            
+            socket.send(packet);
+
+            // Create receive packet
+            // Wait for response
+            byte[] responseData = new byte[requestPacket.length];
+            DatagramPacket responsePacket = new DatagramPacket(
+                responseData, 
+                responseData.length,
+                peerAddress.getAddress(),
+                peerAddress.getPort()
+            );
+
+            socket.setSoTimeout(1000);
+
+            // Keep reading until we get a valid echo response or timeout
+            long endTime = System.currentTimeMillis() + 1000;  // 1 second total time
+            while (System.currentTimeMillis() < endTime) {
+                socket.receive(responsePacket);
+                
+                // Skip if not an echo message
+                if (responsePacket.getLength() < 2) {
+                    continue;
+                }
+
+                if (responseData[0] != MSG_TYPE_ECHO) {
+                    log.debug("Received non-echo message (type: {}), skipping", responseData[0]);
+                    continue;
+                }
+
+                if (responseData[1] != ECHO_RESPONSE) {
+                    log.debug("Received non-response echo message (subtype: {}), skipping", responseData[1]);
+                    continue;
+                }
+
+                // Compare just the random data portion
+                byte[] receivedRandomData = Arrays.copyOfRange(responseData, 2, responseData.length);
+                byte[] sentRandomData = Arrays.copyOfRange(requestPacket, 2, requestPacket.length);
+                
+                if (Arrays.equals(receivedRandomData, sentRandomData)) {
+                    log.debug("Received valid echo response from {}", 
+                        responsePacket.getSocketAddress());
+                    return; // Success
+                } else {
+                    log.debug("Received echo response with mismatched data");
+                }
+            }
+            
+            // If we get here, we timed out without finding a valid response
+            if (attempt == maxAttempts) {
+                throw new IOException("Echo response validation failed after exhausting retries");
+            }
+            log.debug("Echo test attempt {} timed out, retrying...", attempt);
+            Thread.sleep(attemptDelay);
+            
+        } catch (SocketTimeoutException e) {
+            if (attempt == maxAttempts) {
+                throw new IOException("UDP connectivity test failed - server not responding after " + 
+                    maxAttempts + " attempts");
+            }
+            log.debug("Echo test attempt {} failed, retrying...", attempt);
+            Thread.sleep(attemptDelay);
         }
     }
+}
     /**
      * Stores the received UDP packet for later processing.
      *
@@ -642,17 +843,21 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
         log.debug("Stored packet from {}", packet.getSocketAddress());
     }
     
+
+
     /**
-     * Constructs a new {@code VPNConnection} instance in client mode.
+     * Constructs a new {@code VPNConnection} instance with specified nodeId.
      *
      * @param peerHost The hostname or IP address of the peer to connect to.
      * @param peerPort The port number of the peer to connect to.
+     * @param isServer A flag indicating whether this is a server instance.
+     * @param nodeId The node ID to use for this connection.
      * @throws Exception If an error occurs during initialization.
      */
-    public VPNConnection(String peerHost, int peerPort) throws Exception {
-        this(peerHost, peerPort, false);
+    public VPNConnection(String peerHost, int peerPort, boolean isServer, byte[] nodeId) throws Exception {
+        this(peerHost, peerPort, isServer, nodeId, new ProofOfWork(nodeId));
     }
-    
+
     /**
      * Sets the gossip handler responsible for processing gossip protocol messages.
      *
@@ -666,16 +871,155 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
     }
     
     /**
-     * Handles the first message received from a new peer by establishing the initial connection state.
-     *
-     * @param packet The received {@link DatagramPacket} from the new peer.
-     * @throws SocketException If an error occurs while handling the message.
-     */
-    private void handleFirstMessage(DatagramPacket packet) throws  SocketException {
-        if (isServer && peerAddress == null) {
-            peerAddress = (InetSocketAddress) packet.getSocketAddress();
-            log.debug("Server connected to peer: {}", peerAddress);
+    * Handles incoming packets based on the current connection phase.
+    *
+    * <p>
+    * Depending on the {@code currentPhase}, this method delegates packet processing to
+    * appropriate handlers. It manages state transitions and ensures that messages are
+    * processed according to the connection's lifecycle.
+    * </p>
+    *
+    * @param packet The received {@link DatagramPacket}.
+    * @param msg    The {@link ByteBuffer} containing the packet's data.
+    * @param type   The type identifier of the received message.
+    */
+    private void handleBasedOnPhase(DatagramPacket packet, ByteBuffer msg, byte type) {
+        try {
+            switch (currentPhase) {
+                case INITIAL, UDP_VERIFIED -> {
+                    if (type == MSG_TYPE_PEER_INFO) {
+                        peerAddress = (InetSocketAddress) packet.getSocketAddress();
+                        log.debug("[UDP-Listener] Processing peer info from: {}", packet.getSocketAddress());
+                        storePacket(packet);
+                        performServerHandshake();
+                        currentPhase = ConnectionPhase.SECURE_CHANNEL_ESTABLISHED;
+                        if (connectionHandler != null) {
+                            connectionHandler.onNewConnection(
+                                peerAddress.getHostString(), 
+                                peerAddress.getPort(), 
+                                this
+                            );
+                        }
+                    }
+                }
+                case SECURE_CHANNEL_ESTABLISHED, NETWORK_HANDSHAKE_COMPLETE -> {
+                    if (crypto.isEstablished()) {
+                        log.debug("[UDP-Listener] Processing established channel message type {} from {}", 
+                            type, packet.getSocketAddress());
+                        handleControlMessage(type, msg);
+                    } else {
+                        log.warn("[UDP-Listener] Received message type {} but channel not established", type);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("[UDP-Listener] Error in phase handler: {}", e.getMessage(), e);
         }
+    }
+    
+    /**
+     * Processes the first message received from a new peer to initiate the handshake process.
+     *
+     * <p>
+     * This method extracts the requesting node's ID from the incoming message and responds
+     * with a verification response containing the local node's ID and a timestamp. It also
+     * updates the connection phase based on the reception of peer information.
+     * </p>
+     *
+     * @param packet The received {@link DatagramPacket} containing the verification request.
+     * @throws SocketException If an error occurs while handling the verification response.
+     */
+    private void handleFirstMessage(DatagramPacket packet) throws SocketException {
+       try {
+           ByteBuffer message = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
+           byte type = message.get();
+
+           log.debug("Received first message type: {}, size: {}, raw data: {}", 
+               type, packet.getLength(), bytesToHex(Arrays.copyOf(packet.getData(), packet.getLength())));
+
+           // Handle verification request
+           if (type == 0x01) {
+               // Check minimum message length (1 byte type + nodeId length)
+               if (packet.getLength() < 1 + nodeId.length) {
+                   log.warn("Message too short for verification request: {} bytes", packet.getLength());
+                   return;
+               }
+
+               // Extract requesting node's ID
+               byte[] requestNodeId = new byte[nodeId.length];
+               if (message.remaining() < nodeId.length) {
+                   log.warn("Incomplete node ID in verification request");
+                   return;
+               }
+               message.get(requestNodeId);
+
+               log.debug("Received verification request from {} with nodeId: {}", 
+                   packet.getSocketAddress(), bytesToHex(requestNodeId));
+
+               // Get our current proof and timestamp
+               byte[] currentProof = pow.getCurrentProof();
+               long timestamp = pow.getTimestamp();
+
+               log.debug("Current proof: {}, timestamp: {}", 
+                   bytesToHex(currentProof), timestamp);
+
+               // Create verification response
+               ByteBuffer response = ByteBuffer.allocate(nodeId.length + 8);
+               response.put(nodeId);
+               response.putLong(timestamp);
+               response.flip();
+
+               log.debug("Created verification response: nodeId {}, timestamp {}, total size {}",
+                   bytesToHex(nodeId), timestamp, response.limit());
+
+               // Send response
+               DatagramPacket responsePacket = new DatagramPacket(
+                   response.array(),
+                   response.limit(),
+                   packet.getAddress(),
+                   packet.getPort()
+               );
+
+               // Log the exact bytes being sent
+               log.debug("Sending response packet with raw data: {}", 
+                   bytesToHex(Arrays.copyOf(response.array(), response.limit())));
+
+               try {
+                   socket.send(responsePacket);
+                   log.debug("Successfully sent verification response");
+               } catch (IOException e) {
+                   log.error("Failed to send verification response: {}", e.getMessage(), e);
+                   throw e;
+               }
+           }
+
+           if (isServer && peerAddress == null) {
+               peerAddress = (InetSocketAddress) packet.getSocketAddress();
+               log.debug("Server connected to peer: {}", peerAddress);
+           }
+       } catch (IOException | IllegalStateException e) {
+           log.error("Error handling first message: {}", e.getMessage(), e);
+           throw new SocketException("Failed to handle first message: " + e.getMessage());
+       }
+   }
+
+    /**
+     * Converts an array of bytes into its corresponding hexadecimal string representation.
+     *
+     * <p>
+     * This utility method is useful for logging binary data in a human-readable hexadecimal format,
+     * aiding in debugging and monitoring network messages.
+     * </p>
+     *
+     * @param bytes The array of bytes to convert.
+     * @return A {@code String} representing the hexadecimal values of the input bytes.
+     */
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder hex = new StringBuilder();
+        for (byte b : bytes) {
+            hex.append(String.format("%02x", b));
+        }
+        return hex.toString();
     }
     
     /**
@@ -827,11 +1171,17 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
     }
 
     /**
-     * Handles control messages such as gossip, proof of work, and peer information.
+     * Processes control messages such as gossip, proof of work, and peer information.
      *
-     * @param type    The type of the message received.
+     * <p>
+     * Depending on the message type, this method delegates processing to the appropriate
+     * handlers. It ensures that control messages are handled securely and correctly,
+     * maintaining the integrity of the VPN connection.
+     * </p>
+     *
+     * @param type    The type identifier of the received control message.
      * @param message The {@link ByteBuffer} containing the message data.
-     * @throws IOException If an error occurs during message handling.
+     * @throws IOException If an error occurs during message processing.
      */
     private void handleControlMessage(byte type, ByteBuffer message) {    
         try {
@@ -945,15 +1295,16 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
      * @return The data payload of the received message, or {@code null} if no message is received.
      * @throws IOException If an error occurs during receiving.
      */
-    public byte[] receiveMessage() throws IOException {
-        byte[] buffer = new byte[MAX_PACKET_SIZE];
-        DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+private byte[] receiveMessage() throws IOException {
+    byte[] buffer = new byte[MAX_PACKET_SIZE];
+    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
 
-        try {
-            log.debug("Waiting to receive message on port {} from {}", 
-                socket.getLocalPort(),
-                isServer ? "any" : peerAddress);
+    try {
+        log.debug("Waiting to receive message on port {} from {}", 
+            socket.getLocalPort(),
+            isServer ? "any" : peerAddress);
 
+        while (running) {  // Loop until we get a non-echo message
             // Check if we have a stored packet first
             synchronized(this) {
                 if (lastReceivedPacket != null) {
@@ -970,31 +1321,43 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
                 packet.getSocketAddress());
             lastReceivedTime = System.currentTimeMillis();
 
-            if (isServer && peerAddress == null) {
-                handleFirstMessage(packet);
-            }
-
-            // Create new buffer with exact received length
             ByteBuffer message = ByteBuffer.wrap(
                 packet.getData(),
                 packet.getOffset(),
                 packet.getLength()
             );
 
+            if (!message.hasRemaining()) {
+                log.warn("Received empty packet");
+                continue;
+            }
+
             byte type = message.get();
+            log.debug("Received message type: {} ({})", 
+                MESSAGE_TYPE_NAMES.getOrDefault(type, "UNKNOWN"), type);
+
+            // Handle echo requests immediately and continue listening
+            if (type == MSG_TYPE_ECHO) {
+                handleEchoPacket(packet);
+                continue;  // Keep listening for non-echo messages
+            }
+
+            // For non-echo messages, return the data
             byte[] data = new byte[message.remaining()];
             message.get(data);
-
             return data;
-
-        } catch (IOException e) {
-            if ("Connection closed by peer".equals(e.getMessage())) {
-                setRunning(false);
-                socket.close();
-            }
-            throw e;
         }
+
+        throw new IOException("Connection closed while receiving message");
+
+    } catch (IOException e) {
+        if ("Connection closed by peer".equals(e.getMessage())) {
+            setRunning(false);
+            socket.close();
+        }
+        throw e;
     }
+}
 
 
     
@@ -1100,36 +1463,45 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
      * @return A byte array containing the decrypted peer information.
      * @throws IOException If an error occurs during receiving or decryption.
      */
-    public byte[] receivePeerInfo() throws IOException {
-        byte[] buffer = new byte[MAX_PACKET_SIZE];
-        DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+ public byte[] receivePeerInfo() throws IOException {
+    byte[] buffer = new byte[MAX_PACKET_SIZE];
+    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
 
-        try {
-            socket.receive(packet);
-            lastReceivedTime = System.currentTimeMillis();
+    try {
+        socket.receive(packet);
+        lastReceivedTime = System.currentTimeMillis();
 
-            ByteBuffer message = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
-            byte type = message.get();
+        ByteBuffer message = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
+        byte type = message.get();
 
-            if (type != MSG_TYPE_PEER_INFO) {
-                throw new IOException("Expected peer info message, got: " + type);
-            }
-
-            byte[] data = new byte[message.remaining()];
-            message.get(data);
-
-            // Only try to decrypt if secure channel is established
-            if (crypto.isEstablished()) {
-                return crypto.decryptMessage(data);
-            }
-            return data;
-        } catch (Exception e) {
-            if (e instanceof IOException iOException) {
-                throw iOException;
-            }
-            throw new IOException("Failed to receive peer info", e);
+        // Handle echo requests during handshake
+        if (type == MSG_TYPE_ECHO) {
+            handleEchoPacket(packet);
+            // After handling echo, try to receive peer info again
+            return receivePeerInfo();
         }
+
+        if (type != MSG_TYPE_PEER_INFO) {
+            throw new IOException(String.format("Expected peer info message (%d), got: %d (%s)", 
+                MSG_TYPE_PEER_INFO, type, 
+                MESSAGE_TYPE_NAMES.getOrDefault(type, "UNKNOWN")));
+        }
+
+        byte[] data = new byte[message.remaining()];
+        message.get(data);
+
+        // Only try to decrypt if secure channel is established
+        if (crypto.isEstablished()) {
+            return crypto.decryptMessage(data);
+        }
+        return data;
+    } catch (Exception e) {
+        if (e instanceof IOException iOException) {
+            throw iOException;
+        }
+        throw new IOException("Failed to receive peer info: " + e.getMessage(), e);
     }
+}
 
     /**
      * Receives a proof of work message during the handshake process.

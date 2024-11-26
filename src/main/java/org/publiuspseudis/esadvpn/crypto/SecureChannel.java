@@ -29,6 +29,8 @@ import java.security.SecureRandom;
 import java.security.spec.ECGenParameterSpec;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 import javax.crypto.Cipher;
 import javax.crypto.KeyAgreement;
 import javax.crypto.SecretKey;
@@ -148,6 +150,12 @@ public class SecureChannel implements SecureChannelHandler {
      */
     private volatile boolean established = false;
 
+    
+    private volatile byte[] sessionId;
+    private volatile long lastRekeyed;
+    private static final long REKEY_INTERVAL = TimeUnit.HOURS.toMillis(1);
+    private static final int NONCE_SIZE = 32;
+    
     /**
      * Constructs a new {@code SecureChannel} instance by generating an EC key pair using the
      * "secp256r1" curve. This key pair is used for establishing a shared secret with a peer.
@@ -183,36 +191,45 @@ public class SecureChannel implements SecureChannelHandler {
      */
     @Override
     public void establishSecureChannel(byte[] peerPublicKey) throws IOException {
-        try {
-            // Convert the peer's public key bytes into a PublicKey object
-            KeyFactory keyFactory = KeyFactory.getInstance("EC");
-            X509EncodedKeySpec keySpec = new X509EncodedKeySpec(peerPublicKey);
-            PublicKey peerKey = keyFactory.generatePublic(keySpec);
-            
-            // Initialize KeyAgreement for ECDH
-            KeyAgreement keyAgreement = KeyAgreement.getInstance("ECDH");
-            keyAgreement.init(keyPair.getPrivate());
-            
-            // Perform the key agreement phase with the peer's public key
-            keyAgreement.doPhase(peerKey, true);
-            
-            // Generate the shared secret
-            byte[] sharedSecretBytes = keyAgreement.generateSecret();
-            
-            // Derive a symmetric key (AES) from the shared secret using SHA-256 hashing
-            MessageDigest hash = MessageDigest.getInstance("SHA-256");
-            byte[] digestedSecret = hash.digest(sharedSecretBytes);
-            this.sharedSecret = new SecretKeySpec(digestedSecret, "AES");
-            
-            // Mark the secure channel as established
-            this.established = true;
-            
-            log.info("Secure channel established successfully.");
-        } catch (InvalidKeyException | NoSuchAlgorithmException | InvalidKeySpecException e) {
-            log.error("Failed to establish secure channel: {}", e.getMessage());
-            throw new IOException("Failed to establish secure channel", e);
-        }
-    }
+       try {
+           // Generate session nonce
+           byte[] localNonce = new byte[NONCE_SIZE];
+           random.nextBytes(localNonce);
+
+           // Convert peer's public key
+           KeyFactory keyFactory = KeyFactory.getInstance("EC");
+           X509EncodedKeySpec keySpec = new X509EncodedKeySpec(peerPublicKey);
+           PublicKey peerKey = keyFactory.generatePublic(keySpec);
+
+           // Initialize KeyAgreement for ECDH
+           KeyAgreement keyAgreement = KeyAgreement.getInstance("ECDH");
+           keyAgreement.init(keyPair.getPrivate());
+
+           // Perform the key agreement phase with the peer's public key
+           keyAgreement.doPhase(peerKey, true);
+
+           // Generate the shared secret
+           byte[] sharedSecretBytes = keyAgreement.generateSecret();
+
+           // Combine secret with nonce
+           ByteBuffer material = ByteBuffer.allocate(sharedSecretBytes.length + localNonce.length);
+           material.put(sharedSecretBytes).put(localNonce).flip();
+
+           // Derive key and session ID
+           MessageDigest hash = MessageDigest.getInstance("SHA-256");
+           byte[] digestedSecret = hash.digest(material.array());
+
+           byte[] keyBytes = Arrays.copyOfRange(digestedSecret, 0, 16);
+           this.sessionId = Arrays.copyOfRange(digestedSecret, 16, 32);
+           this.sharedSecret = new SecretKeySpec(keyBytes, "AES");
+           this.lastRekeyed = System.currentTimeMillis();
+
+           this.established = true;
+
+       } catch (InvalidKeyException | NoSuchAlgorithmException | InvalidKeySpecException e) {
+           throw new IOException("Failed to establish secure channel", e);
+       }
+   }
 
     /**
      * Retrieves the local public key used for establishing secure channels with peers. This key should be
@@ -234,26 +251,42 @@ public class SecureChannel implements SecureChannelHandler {
      * @throws Exception If an error occurs during the encryption process, such as cipher initialization
      *                   failures or encryption algorithm issues.
      */
+
     @Override
     public byte[] encryptMessage(byte[] data) throws Exception {
         if (!established) {
-            // If the secure channel is not established, return the plaintext data unencrypted
             return data;
         }
 
-        // Generate a 12-byte IV for AES-GCM (recommended size)
+        // Check if rekey needed
+        if (System.currentTimeMillis() - lastRekeyed > REKEY_INTERVAL) {
+            byte[] newNonce = new byte[NONCE_SIZE];
+            random.nextBytes(newNonce);
+            MessageDigest hash = MessageDigest.getInstance("SHA-256");
+            hash.update(sharedSecret.getEncoded());
+            hash.update(newNonce);
+            byte[] newSecret = hash.digest();
+            this.sharedSecret = new SecretKeySpec(newSecret, "AES");
+            this.lastRekeyed = System.currentTimeMillis();
+        }
+
+        // Generate IV for AES-GCM
         byte[] iv = new byte[12];
         random.nextBytes(iv);
-        
-        // Initialize the Cipher for encryption using AES-GCM
+
+        // Initialize cipher for encryption
         Cipher cipher = Cipher.getInstance(ALGORITHM);
-        cipher.init(Cipher.ENCRYPT_MODE, sharedSecret, 
-            new GCMParameterSpec(128, iv)); // 128-bit authentication tag
-        
+        cipher.init(Cipher.ENCRYPT_MODE, sharedSecret, new GCMParameterSpec(128, iv));
+
+        // Add session ID as additional authenticated data
+        if (sessionId != null) {
+            cipher.updateAAD(sessionId);
+        }
+
         // Perform encryption
         byte[] encrypted = cipher.doFinal(data);
-        
-        // Concatenate IV and encrypted data for transmission
+
+        // Combine IV and encrypted data
         ByteBuffer result = ByteBuffer.allocate(iv.length + encrypted.length);
         result.put(iv).put(encrypted);
         return result.array();
@@ -275,20 +308,24 @@ public class SecureChannel implements SecureChannelHandler {
             throw new IllegalArgumentException("Invalid message format or secure channel not established.");
         }
 
-        // Extract the IV (first 12 bytes) from the ciphertext
+        // Extract the IV (first 12 bytes)
         ByteBuffer buffer = ByteBuffer.wrap(data);
         byte[] iv = new byte[12];
         buffer.get(iv);
-        
+
         // Extract the actual encrypted data
         byte[] encrypted = new byte[buffer.remaining()];
         buffer.get(encrypted);
-        
-        // Initialize the Cipher for decryption using AES-GCM
+
+        // Initialize cipher for decryption
         Cipher cipher = Cipher.getInstance(ALGORITHM);
-        cipher.init(Cipher.DECRYPT_MODE, sharedSecret,
-            new GCMParameterSpec(128, iv)); // 128-bit authentication tag
-        
+        cipher.init(Cipher.DECRYPT_MODE, sharedSecret, new GCMParameterSpec(128, iv));
+
+        // Add session ID as additional authenticated data
+        if (sessionId != null) {
+            cipher.updateAAD(sessionId);
+        }
+
         // Perform decryption
         return cipher.doFinal(encrypted);
     }

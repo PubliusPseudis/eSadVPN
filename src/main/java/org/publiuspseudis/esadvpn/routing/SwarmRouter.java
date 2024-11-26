@@ -104,25 +104,39 @@ public class SwarmRouter {
     
     /**
      * Routing table mapping destinations to their respective routes and next-hop peers.
-     * Structure: Destination -> (NextHop -> RouteInfo)
+     * <p>
+     * Structure: Destination -> (NextHop -> {@link RouteInfo})
+     * </p>
      */
     private final Map<String, Map<String, RouteInfo>> routingTable;
     
     /**
-     * Pheromone trails tracking the desirability of routes. Each entry maps a destination-nextHop
-     * combination to its pheromone level.
+     * Pheromone trails tracking the desirability of routes.
+     * <p>
+     * Each entry maps a destination-nextHop combination to its pheromone level.
+     * </p>
      */
     private final Map<String, Double> pheromoneTrails;
     
     /**
-     * Tracks the last usage timestamp of each route. Used to identify and clean up stale routes.
+     * Queue for incoming data packets to be routed.
+     */
+    private final BlockingQueue<ByteBuffer> packetQueue = new LinkedBlockingQueue<>();
+    
+    /**
+     * Tracks the last usage timestamp of each route.
+     * <p>
+     * Used to identify and clean up stale routes.
      * Structure: Destination-NextHop -> LastUsedTimestamp
+     * </p>
      */
     private final Map<String, Long> routeLastUsed;
     
     /**
      * Packet queues for each peer, facilitating the forwarding of data packets to the respective peers.
+     * <p>
      * Structure: PeerId -> Queue of ByteBuffers
+     * </p>
      */
     private final Map<String, BlockingQueue<ByteBuffer>> peerQueues;
     
@@ -139,12 +153,18 @@ public class SwarmRouter {
     private static final double PHEROMONE_DECAY = 0.95;
     
     /**
-     * The minimum pheromone level that a route can have. Ensures that routes do not become completely obsolete.
+     * The minimum pheromone level that a route can have.
+     * <p>
+     * Ensures that routes do not become completely obsolete.
+     * </p>
      */
     private static final double MIN_PHEROMONE = 0.01;
     
     /**
      * The timeout duration after which a route is considered stale if not used.
+     * <p>
+     * Specified in milliseconds.
+     * </p>
      */
     private static final long ROUTE_TIMEOUT = TimeUnit.MINUTES.toMillis(30);
     
@@ -161,7 +181,9 @@ public class SwarmRouter {
     
     /**
      * Adds a new route or updates an existing one based on the destination, next hop, and hop count.
+     * <p>
      * If the new route has a lower hop count, it replaces the existing route.
+     * </p>
      *
      * @param destination The destination network or IP address.
      * @param nextHop     The identifier of the next hop peer.
@@ -181,7 +203,9 @@ public class SwarmRouter {
     
     /**
      * Updates the routing metrics for a specific route based on observed latency and bandwidth.
+     * <p>
      * Reinforces the pheromone trail of the route based on its performance.
+     * </p>
      *
      * @param destination The destination network or IP address.
      * @param nextHop     The identifier of the next hop peer.
@@ -214,8 +238,10 @@ public class SwarmRouter {
     
     /**
      * Determines the next hop peer for a given destination based on route scores and pheromone trails.
+     * <p>
      * Utilizes a probabilistic selection mechanism influenced by pheromone levels to choose the most
      * suitable next hop.
+     * </p>
      *
      * @param destination The destination network or IP address.
      * @return The identifier of the selected next hop peer, or {@code null} if no route is available.
@@ -279,9 +305,11 @@ public class SwarmRouter {
     }
     
     /**
-     * Cleans up stale routes that have not been used within the specified timeout period. Removes
-     * both the route from the routing table and its associated pheromone trail to maintain an
+     * Cleans up stale routes that have not been used within the specified timeout period.
+     * <p>
+     * Removes both the route from the routing table and its associated pheromone trail to maintain an
      * up-to-date and efficient routing state.
+     * </p>
      */
     public void cleanupRoutes() {
         long now = System.currentTimeMillis();
@@ -303,35 +331,29 @@ public class SwarmRouter {
      * @param peerId The identifier of the peer to which the packet should be sent.
      */
     public void routePacket(ByteBuffer packet, String peerId) {
-        BlockingQueue<ByteBuffer> queue = peerQueues.computeIfAbsent(
-            peerId, k -> new LinkedBlockingQueue<>());
-            
-        if (!queue.offer(packet)) {
-            log.warn("Queue full for peer {}, dropping packet", peerId);
-        }
+        packetQueue.offer(packet);
     }
     
     /**
-     * Retrieves the next available data packet to be sent to any peer. Implements a simple
-     * round-robin mechanism to poll packets from all peer queues in a sequential manner.
+     * Retrieves the next available data packet to be sent to any peer.
+     * <p>
+     * Implements a simple polling mechanism to retrieve packets from the queue in a sequential manner.
+     * </p>
      *
-     * @return The next {@link ByteBuffer} packet to be sent, or {@code null} if no packets are available.
+     * @return The next {@link ByteBuffer} packet to be sent, or {@code null} if no packets are available within the timeout.
+     * @throws InterruptedException If the thread is interrupted while waiting for a packet.
      */
-    public ByteBuffer getNextPacket() {
-        // Check all peer queues round-robin
-        for (BlockingQueue<ByteBuffer> queue : peerQueues.values()) {
-            ByteBuffer packet = queue.poll();
-            if (packet != null) {
-                return packet;
-            }
-        }
-        return null;
+    public ByteBuffer getNextPacket() throws InterruptedException {
+        // Try to get a packet with a timeout to prevent busy waiting
+        return packetQueue.poll(100, TimeUnit.MILLISECONDS);
     }
     
     /**
      * Removes a peer from the router, including its routes, pheromone trails, and packet queue.
+     * <p>
      * Ensures that all routing information associated with the peer is cleaned up to prevent
      * stale or invalid routes.
+     * </p>
      *
      * @param peerId The identifier of the peer to be removed.
      */
@@ -345,11 +367,15 @@ public class SwarmRouter {
             
         // Remove queue
         peerQueues.remove(peerId);
+        
+        log.info("Removed peer {}", peerId);
     }
     
     /**
-     * Retrieves a snapshot of all current routes managed by the router. This includes all destinations
-     * and their associated next-hop peers with routing information.
+     * Retrieves a snapshot of all current routes managed by the router.
+     * <p>
+     * This includes all destinations and their associated next-hop peers with routing information.
+     * </p>
      *
      * @return A {@link Map} representing the current routing table.
      */
@@ -359,7 +385,9 @@ public class SwarmRouter {
     
     /**
      * Calculates and retrieves the highest route score for a specific peer across all destinations.
+     * <p>
      * This score represents the best performance metric of the peer based on current routing metrics.
+     * </p>
      *
      * @param peerId The identifier of the peer whose score is to be retrieved.
      * @return The highest route score for the specified peer, or {@code 0.0} if no routes are found.
@@ -384,9 +412,9 @@ public class SwarmRouter {
      */
     public Map<String, Object> exportState() {
         Map<String, Object> state = new HashMap<>();
-        state.put("routingTable", routingTable);
-        state.put("pheromoneTrails", pheromoneTrails);
-        state.put("routeLastUsed", routeLastUsed);
+        state.put("routingTable", new HashMap<>(routingTable));
+        state.put("pheromoneTrails", new HashMap<>(pheromoneTrails));
+        state.put("routeLastUsed", new HashMap<>(routeLastUsed));
         return state;
     }
 }

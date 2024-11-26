@@ -23,8 +23,8 @@ import org.slf4j.LoggerFactory;
 
 /**
  * <p>
- * The {@code Main} class serves as the entry point for the Publius Pseudis Enterprise Secure 
- * Decentralized VPN (ESADVPN) application. It initializes and manages the lifecycle of 
+ * The {@code Main} class serves as the entry point for the Publius Pseudis Everyday Swarm 
+ * Assisted Decentralized VPN (ESADVPN) application. It initializes and manages the lifecycle of 
  * VPN nodes within a peer-to-peer (P2P) network and sets up a SOCKS proxy to facilitate 
  * secure internet access through the VPN.
  * </p>
@@ -121,7 +121,7 @@ public class Main {
      *               <li>For <strong>connect</strong> mode: <code>connect [local-port] [peer-host] [peer-port]</code></li>
      *             </ul>
      */
-    public static void main(String[] args) {
+        public static void main(String[] args) {
         try {
             if (args.length < 2) {
                 printUsage();
@@ -134,13 +134,8 @@ public class Main {
             switch (mode) {
                 case "p2p" -> {
                     log.info("Starting P2P VPN node on port {}", port);
-                    P2PNetwork network = new P2PNetwork(port, true);  // true = initiator
+                    P2PNetwork network = new P2PNetwork(port, true, null);  // true = initiator, don't need peer address since we would be the initator.
                     network.start();
-                    
-                    // Start SOCKS proxy using network's UDP handler
-                    int socksPort = port + 1;
-                    log.info("Starting SOCKS proxy on port {}", socksPort);
-                    new SocksProxy(network.getUDPHandler(), socksPort);
                 }
                 case "connect" -> {
                     if (args.length < 4) {
@@ -151,14 +146,17 @@ public class Main {
                     String peerHost = args[2];
                     int peerPort = Integer.parseInt(args[3]);
                     log.info("Connecting to P2P network via {}:{}", peerHost, peerPort);
-                    P2PNetwork network = new P2PNetwork(port, false);  // false = joiner
-                    network.start();
-                    network.connectToPeer(peerHost, peerPort);
+                    String peerAddress = peerHost + ":" + peerPort;
+                    P2PNetwork network = new P2PNetwork(port, false, peerAddress);  // Pass peer address
                     
-                    // Start SOCKS proxy
-                    int socksPort = port + 1;
-                    log.info("Starting SOCKS proxy on port {}", socksPort);
-                    new SocksProxy(network.getUDPHandler(), socksPort);
+                    // Start the network and ensure SOCKS proxy is started
+                    try {
+                        network.start();
+                        log.info("P2P network and SOCKS proxy started successfully");
+                    } catch (Exception e) {
+                        log.error("Failed to start network or SOCKS proxy: {}", e.getMessage());
+                        throw e;
+                    }
                 }
                 default -> {
                     System.out.println("Invalid mode. Use 'p2p' or 'connect'");
@@ -174,6 +172,7 @@ public class Main {
             System.exit(1);
         }
     }
+
 
     /**
      * Prints the usage instructions for the ESADVPN application.

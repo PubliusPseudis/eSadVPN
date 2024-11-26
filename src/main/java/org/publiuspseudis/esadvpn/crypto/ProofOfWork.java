@@ -103,20 +103,41 @@ public class ProofOfWork {
 
     /**
      * The current valid proof of work. This includes the node ID, timestamp, and nonce.
+     *
+     * <p>
+     * Once a valid proof is found using the {@link #solve()} method, this field stores the proof data
+     * that satisfies the difficulty requirement. It is used for verifying the legitimacy of the node
+     * within the network.
+     * </p>
      */
     private volatile byte[] currentProof;
 
     /**
      * The timestamp indicating when the current proof of work was generated.
+     *
+     * <p>
+     * This timestamp is used to ensure the freshness of the proof and to prevent replay attacks
+     * by associating the proof with a specific moment in time.
+     * </p>
      */
     private volatile long timestamp;
 
     /**
      * Constructs a new {@code ProofOfWork} instance with the specified node ID.
      *
+     * <p>
+     * Initializes the proof of work with the provided unique node identifier. The constructor sets
+     * the initial timestamp to the current system time to ensure the proof's validity period.
+     * </p>
+     *
      * @param nodeId The unique node ID for which the proof of work is to be generated and verified.
+     *               Must be a non-null byte array of a specific length (e.g., 32 bytes).
+     * @throws IllegalArgumentException If {@code nodeId} is {@code null} or does not meet the required criteria.
      */
     public ProofOfWork(byte[] nodeId) {
+        if (nodeId == null) {
+            throw new IllegalArgumentException("nodeId cannot be null");
+        }
         this.nodeId = nodeId;
         this.timestamp = System.currentTimeMillis();
     }
@@ -195,51 +216,86 @@ public class ProofOfWork {
      * Verifies the validity of a received proof of work by ensuring it meets the difficulty criteria
      * and that its timestamp is within acceptable bounds.
      *
-     * @param proofData     The byte array containing the proof of work data (node ID + timestamp + nonce).
-     * @param proofTimestamp The timestamp associated with the proof of work.
-     * @return {@code true} if the proof is valid; {@code false} otherwise.
+     * <p>
+     * This method checks that the proof's timestamp is neither too old nor set in the future,
+     * preventing replay attacks and ensuring proof freshness. It then validates the proof by
+     * hashing the provided proof data and confirming that the resulting hash has the required
+     * number of leading zero bits as defined by the {@link #DIFFICULTY} constant.
+     * </p>
+     *
+     * @param proofData      The byte array containing the proof of work data (node ID + timestamp + nonce).
+     *                       Must be structured correctly to match the hashing criteria.
+     * @param proofTimestamp The timestamp associated with the proof of work in milliseconds since the epoch.
+     *                       This should closely align with the current system time to be considered valid.
+     * @return {@code true} if the proof is valid and meets all criteria; {@code false} otherwise.
      */
     public boolean verify(byte[] proofData, long proofTimestamp) {
-        // Check timestamp bounds to ensure proof freshness
-        long now = System.currentTimeMillis();
-        if (now - proofTimestamp > TimeUnit.DAYS.toMillis(1)) {
-            log.warn("Proof expired. Current time: {}, Proof time: {}", now, proofTimestamp);
-            return false;
+      // Check timestamp bounds to ensure proof freshness
+      long now = System.currentTimeMillis();
+      log.debug("Verifying proof - Current time: {}, Proof time: {}, Delta: {}ms", 
+          now, proofTimestamp, now - proofTimestamp);
+
+      if (now - proofTimestamp > TimeUnit.DAYS.toMillis(1)) {
+          log.warn("Proof expired. Current time: {}, Proof time: {}", now, proofTimestamp);
+          return false;
+      }
+      if (proofTimestamp > now + TimeUnit.MINUTES.toMillis(5)) {
+          log.warn("Proof from future. Current time: {}, Proof time: {}", now, proofTimestamp);
+          return false;
+      }
+
+      try {
+          // Extract nodeId and timestamp
+          log.debug("Proof data length: {}, content: {}", 
+              proofData.length, bytesToHex(proofData));
+
+          // Calculate hash
+          MessageDigest digest = MessageDigest.getInstance("SHA-256");
+          byte[] hash = digest.digest(proofData);
+
+          log.debug("Calculated hash: {}", bytesToHex(hash));
+
+          int leadingZeros = countLeadingZeros(hash);
+          log.debug("Leading zeros required: {}, found: {}", 
+              DIFFICULTY, leadingZeros);
+
+          return leadingZeros >= DIFFICULTY;
+
+      } catch (NoSuchAlgorithmException e) {
+          log.error("Failed to verify proof: {}", e.getMessage(), e);
+          return false;
+      }
+  }
+    /**
+     * Converts an array of bytes into its corresponding hexadecimal string representation.
+     *
+     * <p>
+     * This utility method is useful for logging binary data in a human-readable hexadecimal format,
+     * aiding in debugging and monitoring network messages or cryptographic operations.
+     * </p>
+     *
+     * @param bytes The array of bytes to convert.
+     * @return A {@code String} representing the hexadecimal values of the input bytes.
+     */
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder hex = new StringBuilder();
+        for (byte b : bytes) {
+            hex.append(String.format("%02x", b));
         }
-        if (proofTimestamp > now + TimeUnit.MINUTES.toMillis(5)) {
-            log.warn("Proof from future. Current time: {}, Proof time: {}", now, proofTimestamp);
-            return false;
-        }
-
-        try {
-            // Extract nodeId, timestamp, and nonce from proof
-            byte[] verify_nodeId = Arrays.copyOfRange(proofData, 0, 32);
-            long verify_timestamp = ByteBuffer.wrap(proofData, 32, 8).getLong();
-            long nonce = ByteBuffer.wrap(proofData, 40, 8).getLong();
-
-            log.debug("Verifying proof - NodeId length: {}, Timestamp: {}, Nonce: {}", 
-                     verify_nodeId.length, verify_timestamp, nonce);
-
-            // Verify the hash
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(proofData);
-
-            int leadingZeros = countLeadingZeros(hash);
-            log.debug("Proof verification - Required zeros: {}, Found zeros: {}", 
-                     DIFFICULTY, leadingZeros);
-
-            return leadingZeros >= DIFFICULTY;
-        } catch (NoSuchAlgorithmException e) {
-            log.error("Failed to verify proof: {}", e.getMessage());
-            return false;
-        }
+        return hex.toString();
     }
 
     /**
-     * Counts the number of leading zero bits in a given hash.
+     * Counts the number of leading zero bits in a given SHA-256 hash.
      *
-     * @param hash The byte array representing the hash.
-     * @return The total number of leading zero bits.
+     * <p>
+     * This method iterates through the bytes of the hash, counting the number of consecutive zero bits
+     * from the start. The count is used to determine if the hash meets the required difficulty level
+     * for a valid proof of work.
+     * </p>
+     *
+     * @param hash The byte array representing the SHA-256 hash to evaluate.
+     * @return The total number of leading zero bits in the hash.
      */
     private int countLeadingZeros(byte[] hash) {
         int leadingZeros = 0;

@@ -22,6 +22,7 @@ import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -188,29 +189,14 @@ public class VirtualInterface implements AutoCloseable {
      * 
      * @param packet The {@link ByteBuffer} containing the packet data to be written.
      */
-    public void write(ByteBuffer packet) {
+    public void write(ByteBuffer packet) throws InterruptedException {
         if (!running.get() || packet == null || !packet.hasRemaining()) {
             return;
         }
 
-        ByteBuffer buffer = null;
-        try {
-            buffer = getBuffer();
-            if (buffer == null) {
-                log.warn("Buffer pool exhausted, dropping packet");
-                return;
-            }
-
-            buffer.clear();
-            buffer.put(packet);
-            buffer.flip();
-
-            ingressQueue.offer(buffer);
-        } catch (Exception e) {
-            log.error("Failed to write packet: {}", e.getMessage());
-            if (buffer != null) {
-                releaseBuffer(buffer);
-            }
+        // Try to write to the egress queue with a timeout
+        if (!egressQueue.offer(packet, 100, TimeUnit.MILLISECONDS)) {
+            log.warn("Write operation timed out after 100ms");
         }
     }
 
@@ -223,19 +209,17 @@ public class VirtualInterface implements AutoCloseable {
      * </p>
      * 
      * @return A {@link ByteBuffer} containing the packet data, or {@code null} if no packet is available.
+     * @throws java.lang.InterruptedException
      */
-    public ByteBuffer read() {
+    public ByteBuffer read() throws InterruptedException {
         if (!running.get()) {
             return null;
         }
 
-        try {
-            ByteBuffer packet = egressQueue.poll();
-            if (packet != null && packet.hasRemaining()) {
-                return packet;
-            }
-        } catch (Exception e) {
-            log.error("Failed to read packet: {}", e.getMessage());
+        // Try to read from the ingress queue with a timeout
+        ByteBuffer buffer = ingressQueue.poll(100, TimeUnit.MILLISECONDS);
+        if (buffer != null && buffer.hasRemaining()) {
+            return buffer;
         }
         return null;
     }
