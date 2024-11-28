@@ -23,6 +23,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import org.publiuspseudis.esadvpn.network.Peer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -101,7 +102,7 @@ public class SwarmRouter {
      * Logger instance for logging informational, debug, and error messages.
      */
     private static final Logger log = LoggerFactory.getLogger(SwarmRouter.class);
-    
+        private volatile Peer owningPeer;
     /**
      * Routing table mapping destinations to their respective routes and next-hop peers.
      * <p>
@@ -171,13 +172,23 @@ public class SwarmRouter {
     /**
      * Constructs a new {@code SwarmRouter} instance, initializing routing tables, pheromone trails,
      * and packet queues.
+     * @param owningPeer
      */
+    public SwarmRouter(Peer owningPeer) {
+        this();  // Call no-arg constructor for common initialization
+        this.owningPeer = owningPeer;
+        log.debug("Created SwarmRouter with owning peer: {}", owningPeer.getAddress());
+    }
+    
     public SwarmRouter() {
         this.routingTable = new ConcurrentHashMap<>();
         this.pheromoneTrails = new ConcurrentHashMap<>();
         this.routeLastUsed = new ConcurrentHashMap<>();
         this.peerQueues = new ConcurrentHashMap<>();
+        // owningPeer will be set later via setOwningPeer()
     }
+
+    
     
     /**
      * Adds a new route or updates an existing one based on the destination, next hop, and hop count.
@@ -201,6 +212,25 @@ public class SwarmRouter {
         });
     }
     
+    /**
+    * Sets the owning peer for this router instance. This is called after the local peer
+    * is created to enable reputation-based routing decisions.
+    *
+    * @param peer The local Peer instance that owns this router.
+    */
+   public void setOwningPeer(Peer peer) {
+       this.owningPeer = peer;
+       log.debug("Set owning peer for router: {}", peer.getAddress());
+   }
+
+    /**
+     * Gets the owning peer for this router instance.
+     *
+     * @return The local Peer instance that owns this router.
+     */
+    public Peer getOwningPeer() {
+        return owningPeer;
+    }
     /**
      * Updates the routing metrics for a specific route based on observed latency and bandwidth.
      * <p>
@@ -268,7 +298,9 @@ public class SwarmRouter {
             
             double pheromone = pheromoneTrails.getOrDefault(
                 destination + "-" + nextHop, MIN_PHEROMONE);
-            double score = route.getScore() * pheromone;
+            // Get peer's reputation of this next hop
+            double reputation = owningPeer.getPeerReputation(nextHop);
+            double score = route.getScore(reputation) * pheromone;
             
             scores.put(nextHop, score);
             totalScore += score;

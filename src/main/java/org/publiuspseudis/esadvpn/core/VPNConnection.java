@@ -929,79 +929,68 @@ private void echoTest() throws IOException, InterruptedException {
      * @param packet The received {@link DatagramPacket} containing the verification request.
      * @throws SocketException If an error occurs while handling the verification response.
      */
-    private void handleFirstMessage(DatagramPacket packet) throws SocketException {
-       try {
-           ByteBuffer message = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
-           byte type = message.get();
+   private void handleFirstMessage(DatagramPacket packet) throws SocketException {
+        try {
+            ByteBuffer message = ByteBuffer.wrap(packet.getData(), 0, packet.getLength());
+            byte type = message.get();
 
-           log.debug("Received first message type: {}, size: {}, raw data: {}", 
-               type, packet.getLength(), bytesToHex(Arrays.copyOf(packet.getData(), packet.getLength())));
+            log.debug("Received first message type: {}, size: {}, raw data: {}", 
+                      type, packet.getLength(), 
+                      bytesToHex(Arrays.copyOf(packet.getData(), packet.getLength())));
 
-           // Handle verification request
-           if (type == 0x01) {
-               // Check minimum message length (1 byte type + nodeId length)
-               if (packet.getLength() < 1 + nodeId.length) {
-                   log.warn("Message too short for verification request: {} bytes", packet.getLength());
-                   return;
-               }
+            // Handle verification request
+            if (type == 0x01) {
+                // Check minimum message length (1 byte type + nodeId length)
+                if (packet.getLength() < 1 + nodeId.length) {
+                    log.warn("Message too short for verification request: {} bytes", packet.getLength());
+                    return;
+                }
 
-               // Extract requesting node's ID
-               byte[] requestNodeId = new byte[nodeId.length];
-               if (message.remaining() < nodeId.length) {
-                   log.warn("Incomplete node ID in verification request");
-                   return;
-               }
-               message.get(requestNodeId);
+                // Extract requesting node's ID
+                byte[] requestNodeId = new byte[nodeId.length];
+                message.get(requestNodeId);
 
-               log.debug("Received verification request from {} with nodeId: {}", 
-                   packet.getSocketAddress(), bytesToHex(requestNodeId));
+                log.debug("Received verification request from {} with nodeId length: {}", 
+                    packet.getSocketAddress(), requestNodeId.length);
 
-               // Get our current proof and timestamp
-               byte[] currentProof = pow.getCurrentProof();
-               long timestamp = pow.getTimestamp();
+                // Get current proof and timestamp 
+                byte[] currentProof = pow.getCurrentProof();
+                long timestamp = pow.getTimestamp();
 
-               log.debug("Current proof: {}, timestamp: {}", 
-                   bytesToHex(currentProof), timestamp);
+                if (currentProof == null) {
+                    log.warn("No valid proof available");
+                    return;
+                }
 
-               // Create verification response
-               ByteBuffer response = ByteBuffer.allocate(nodeId.length + 8);
-               response.put(nodeId);
-               response.putLong(timestamp);
-               response.flip();
+                // Create response with nodeId and proof
+                ByteBuffer response = ByteBuffer.allocate(nodeId.length + currentProof.length);
+                response.put(nodeId);          // Include our nodeId
+                response.put(currentProof);    // Include complete proof data
+                response.flip();
 
-               log.debug("Created verification response: nodeId {}, timestamp {}, total size {}",
-                   bytesToHex(nodeId), timestamp, response.limit());
+                log.debug("Sending verification response: nodeId length {}, proof length {}", 
+                    nodeId.length, currentProof.length);
 
-               // Send response
-               DatagramPacket responsePacket = new DatagramPacket(
-                   response.array(),
-                   response.limit(),
-                   packet.getAddress(),
-                   packet.getPort()
-               );
+                DatagramPacket responsePacket = new DatagramPacket(
+                    response.array(),
+                    response.limit(),
+                    packet.getAddress(),
+                    packet.getPort()
+                );
 
-               // Log the exact bytes being sent
-               log.debug("Sending response packet with raw data: {}", 
-                   bytesToHex(Arrays.copyOf(response.array(), response.limit())));
+                socket.send(responsePacket);
+                log.debug("Sent verification response to {}", packet.getSocketAddress());
+            }
 
-               try {
-                   socket.send(responsePacket);
-                   log.debug("Successfully sent verification response");
-               } catch (IOException e) {
-                   log.error("Failed to send verification response: {}", e.getMessage(), e);
-                   throw e;
-               }
-           }
-
-           if (isServer && peerAddress == null) {
-               peerAddress = (InetSocketAddress) packet.getSocketAddress();
-               log.debug("Server connected to peer: {}", peerAddress);
-           }
-       } catch (IOException | IllegalStateException e) {
-           log.error("Error handling first message: {}", e.getMessage(), e);
-           throw new SocketException("Failed to handle first message: " + e.getMessage());
-       }
-   }
+            if (isServer && peerAddress == null) {
+                peerAddress = (InetSocketAddress) packet.getSocketAddress();
+                log.debug("Server connected to peer: {}", peerAddress);
+            }
+        } catch (IOException | IllegalStateException e) {
+            log.error("Error handling first message: {}", e.getMessage());
+            throw new SocketException("Failed to handle first message: " + e.getMessage());
+        }
+    }
 
     /**
      * Converts an array of bytes into its corresponding hexadecimal string representation.

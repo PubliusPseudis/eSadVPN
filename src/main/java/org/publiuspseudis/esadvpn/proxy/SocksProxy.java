@@ -19,7 +19,6 @@ package org.publiuspseudis.esadvpn.proxy;
 import org.publiuspseudis.esadvpn.network.UDPHandler;
 import java.io.*;
 import java.net.*;
-import java.nio.ByteBuffer;
 import java.util.concurrent.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -260,10 +259,9 @@ public class SocksProxy implements AutoCloseable {
                // Start forwarding data
                forwardTraffic(client, target);
 
-           } catch (Exception e) {
+           } catch (IOException e) {
                log.error("Error handling SOCKS5 connection: {}", e.getMessage());
                sendError(out, (byte) 0x04);
-               return;
            }
 
        } catch (IOException e) {

@@ -660,101 +660,74 @@ public final class PeerDiscovery {
      * @param peer The {@link InetSocketAddress} of the peer to verify.
      * @return {@code true} if the peer's proof of work is valid; {@code false} otherwise.
      */
-    public boolean verifyPeer(InetSocketAddress peer) {
-        try (DatagramSocket socket = new DatagramSocket()) {
-            socket.setSoTimeout(5000); // 5-second timeout
+public boolean verifyPeer(InetSocketAddress peer) {
+    try (DatagramSocket socket = new DatagramSocket()) {
+        socket.setSoTimeout(5000); // 5-second timeout
 
-            // Construct verification request packet
-            ByteBuffer request = ByteBuffer.allocate(nodeId.length + 1);
-            request.put((byte) 0x01); // Verification request marker
-            request.put(nodeId);
-            request.flip();
+        // Construct verification request packet with nodeId
+        ByteBuffer request = ByteBuffer.allocate(1 + nodeId.length);
+        request.put((byte) 0x01); // Verification request marker
+        request.put(nodeId);      // Include our nodeId
+        request.flip();
 
-            log.debug("Sending verification request to {}: nodeId length {}, content {}", 
-                    peer, nodeId.length, bytesToHex(nodeId));
+        DatagramPacket packet = new DatagramPacket(
+                request.array(),
+                request.limit(),
+                peer.getAddress(),
+                peer.getPort()
+        );
 
-            DatagramPacket packet = new DatagramPacket(
-                    request.array(),
-                    request.limit(),
-                    peer.getAddress(),
-                    peer.getPort()
-            );
+        // Send verification request
+        socket.send(packet);
+        log.debug("Sent verification request to {} with nodeId length {}", 
+                  peer, nodeId.length);
 
-            // Attempt to send verification request and receive response
-            int maxAttempts = 3;
-            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-                try {
-                    socket.send(packet);
-                    log.debug("Sent verification request to {} (attempt {}/{})", 
-                            peer, attempt, maxAttempts);
+        // Receive response
+        byte[] responseData = new byte[1024];
+        DatagramPacket responsePacket = new DatagramPacket(responseData, responseData.length);
+        socket.receive(responsePacket);
 
-                    // Receive response
-                    byte[] responseData = new byte[1024];
-                    DatagramPacket responsePacket = new DatagramPacket(responseData, responseData.length);
-                    socket.receive(responsePacket);
+        ByteBuffer buffer = ByteBuffer.wrap(responseData, 0, responsePacket.getLength());
 
-                    log.debug("Received verification response from {}: size {}, data {}", 
-                            responsePacket.getSocketAddress(), responsePacket.getLength(), 
-                            bytesToHex(Arrays.copyOf(responseData, responsePacket.getLength())));
-
-                    ByteBuffer buffer = ByteBuffer.wrap(responseData, 0, responsePacket.getLength());
-
-                    // Validate response format
-                    if (buffer.remaining() < nodeId.length + Long.BYTES) {
-                        log.debug("Invalid response size from {}: expected >= {}, got {}", 
-                                peer, nodeId.length + Long.BYTES, buffer.remaining());
-                        continue;
-                    }
-
-                    // Extract peer node ID and timestamp
-                    byte[] peerNodeId = new byte[nodeId.length];
-                    buffer.get(peerNodeId);
-                    long timestamp = buffer.getLong();
-
-                    log.debug("Received nodeId: {}, timestamp: {}", 
-                            bytesToHex(peerNodeId), timestamp);
-
-                    // Construct proof data for verification
-                    byte[] proofData = new byte[peerNodeId.length + Long.BYTES];
-                    System.arraycopy(peerNodeId, 0, proofData, 0, peerNodeId.length);
-                    System.arraycopy(responseData, nodeId.length, proofData, peerNodeId.length, Long.BYTES);
-
-                    log.debug("Constructed proof data for verification: {}", bytesToHex(proofData));
-
-                    // Verify proof of work using ProofOfWork instance
-                    boolean isValid = pow.verify(proofData, timestamp);
-                    log.debug("Proof verification result for {}: {}", peer, isValid);
-
-                    if (!isValid) {
-                        log.debug("Invalid proof of work from peer {}, will retry", peer);
-                        continue;
-                    }
-
-                    // Update PeerState upon successful verification
-                    PeerState newPeerState = new PeerState(peerNodeId, proofData, System.currentTimeMillis(), 1.0);
-                    peerStates.put(peer, newPeerState);
-                    knownPeers.add(peer);
-
-                    log.debug("Successfully verified and added peer {}", peer);
-                    return true;
-
-                } catch (SocketTimeoutException e) {
-                    log.debug("Verification attempt {} timed out for peer {}", attempt, peer);
-                    if (attempt == maxAttempts) {
-                        throw e;
-                    }
-                    // Exponential backoff before retrying
-                    Thread.sleep(1000 * attempt);
-                }
-            }
-
-            return false;
-
-        } catch (Exception e) {
-            log.debug("Peer verification failed for {}: {}", peer, e.getMessage(), e);
+        // Extract peer node ID (32 bytes)
+        if (buffer.remaining() < nodeId.length) {
+            log.debug("Response too short to contain nodeId");
             return false;
         }
+        byte[] peerNodeId = new byte[nodeId.length];
+        buffer.get(peerNodeId);
+
+        // Extract proof data (remaining bytes)
+        int proofLength = buffer.remaining();
+        if (proofLength <= 0) {
+            log.debug("No proof data received from peer");
+            return false;
+        }
+        byte[] proof = new byte[proofLength];
+        buffer.get(proof);
+
+        // Log the received proof data
+        log.debug("Received proof from {}: nodeId length {}, proof size {}", 
+                  peer, peerNodeId.length, proof.length);
+
+        // Verify the proof
+        boolean isValid = pow.verify(proof, System.currentTimeMillis());
+
+        if (!isValid) {
+            log.debug("Invalid proof of work from peer {}, will retry", peer);
+            return false;
+        }
+
+        log.debug("Successfully verified peer {}", peer);
+        return true;
+
+    } catch (Exception e) {
+        log.debug("Peer verification failed for {}: {}", peer, e.getMessage(), e);
+        return false;
     }
+}
+
+
 
     /**
      * Validates a discovery response packet received from a peer.
@@ -815,14 +788,7 @@ public final class PeerDiscovery {
                 peerState.lastVerified = now;
                 peerState.updateReliability(true); // Assuming discovery success
             } else {
-                // For unknown peers, perform proof of work verification
-                if (!pow.verify(respNodeId, timestamp)) {
-                    log.debug("Invalid proof of work in discovery response from {}", 
-                            responsePacket.getAddress());
-                    return false;
-                }
-
-                // Optionally, add the peer with initial PeerState
+                // add the peer with initial PeerState
                 PeerState newPeerState = new PeerState(respNodeId, 
                         Arrays.copyOfRange(responsePacket.getData(), 0, nodeId.length + Long.BYTES),
                         now, 1.0);

@@ -16,123 +16,182 @@
  */
 package org.publiuspseudis.esadvpn.crypto;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.*;
-import java.util.concurrent.*;
-import java.nio.ByteBuffer;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
+ * Implements the Cuckoo Cycle proof-of-work algorithm with an epidemic-style
+ * difficulty adjustment mechanism. This class is responsible for generating
+ * and verifying proofs of work, as well as dynamically adjusting the difficulty
+ * based on both local solve times and peer-reported difficulties.
  * <p>
- * The {@code ProofOfWork} class encapsulates the functionality required to generate and verify
- * proofs of work (PoW) within the peer-to-peer (P2P) VPN network. Proofs of work are essential
- * for securing the network by ensuring that peers perform computationally intensive tasks
- * before being allowed to join or maintain their presence in the network.
+ * The Cuckoo Cycle is a graph-based proof-of-work system designed to be memory-efficient
+ * and resistant to ASIC optimization, making it suitable for decentralized networks.
  * </p>
  * 
  * <p>
- * <strong>Key Functionalities:</strong></p>
- * <ul>
- *   <li>Generating a valid proof of work by finding a nonce that satisfies the difficulty criteria.</li>
- *   <li>Verifying the validity of a given proof of work.</li>
- *   <li>Managing proof-related metadata such as timestamps to ensure freshness and prevent replay attacks.</li>
- * </ul>
- * 
+ * Difficulty adjustment ensures that the time to find a valid proof remains
+ * approximately constant by adapting to changes in network conditions and
+ * computational power.
+ * </p>
  * 
  * <p>
- * <strong>Example Usage:</strong>
+ * Example usage:
  * </p>
  * <pre>{@code
- * // Initialize ProofOfWork with a unique node ID
- * byte[] nodeId = ...; // 32-byte unique identifier
+ * byte[] nodeId = ...; // Initialize node identifier
  * ProofOfWork pow = new ProofOfWork(nodeId);
- * 
- * // Solve for a valid proof
- * boolean solved = pow.solve();
- * if (solved) {
+ * if (pow.solve()) {
  *     byte[] proof = pow.getCurrentProof();
- *     long timestamp = pow.getTimestamp();
- *     // Broadcast proof to peers or use in handshake
- * }
- * 
- * // Verify a received proof
- * boolean isValid = pow.verify(receivedProofData, receivedTimestamp);
- * if (isValid) {
- *     // Accept the peer or update network state
+ *     // Broadcast or use the proof as needed
  * }
  * }</pre>
  * 
- * <p>
- * <strong>Thread Safety:</strong>
- * </p>
- * <p>
- * The {@code ProofOfWork} class is designed to be thread-safe. The `currentProof` and `timestamp` fields
- * are marked as `volatile` to ensure visibility across threads. Additionally, the `solve` and `verify`
- * methods handle their operations in a manner that prevents race conditions, allowing concurrent attempts
- * to solve proofs or verify received proofs without compromising data integrity.
- * </p>
- * 
- * <p>
- * <strong>Dependencies:</strong>
- * </p>
- * <ul>
- *   <li>{@link MessageDigest}: Utilized for hashing operations using the SHA-256 algorithm.</li>
- *   <li>SLF4J Logging Framework: Employed for logging informational, debug, and error messages.</li>
- * </ul>
- * 
- * @author 
+ * @author
  * Publius Pseudis
+ * @version 1.0
+ * @since 2024-01-01
  */
 public class ProofOfWork {
     /**
-     * Logger instance for logging information, warnings, and errors.
+     * Logger instance for logging events and errors.
      */
     private static final Logger log = LoggerFactory.getLogger(ProofOfWork.class);
+    
+    // Cuckoo Cycle parameters
 
     /**
-     * The number of leading zero bits required in the hash to consider a proof as valid.
+     * Current difficulty level represented by the number of edge bits.
+     * Volatile to ensure visibility across threads.
      */
-    private static final int DIFFICULTY = 20; // Number of leading zero bits required
+    private volatile int edgeBits;  // Current difficulty (default 16)
 
     /**
-     * The unique node ID associated with this proof of work instance.
+     * Number of nodes in the Cuckoo graph, calculated as 2^edgeBits.
+     * Volatile to ensure visibility across threads.
+     */
+    private volatile int numNodes;  // 2^edgeBits
+
+    /**
+     * Number of edges in the Cuckoo graph, equal to the number of nodes.
+     * Volatile to ensure visibility across threads.
+     */
+    private volatile int numEdges;  // Same as numNodes
+
+    /**
+     * Minimum allowed value for edgeBits to prevent the graph from being too small.
+     */
+    private static final int MIN_EDGE_BITS = 6;
+
+    /**
+     * Maximum allowed value for edgeBits to prevent the graph from being too large.
+     */
+    private static final int MAX_EDGE_BITS = 12;
+
+    /**
+     * Desired length of the cycle to be found in the Cuckoo graph.
+     */
+    private static final int CYCLE_LENGTH = 8;
+
+    /**
+     * Maximum number of solutions to store or consider.
+     */
+    private static final int MAX_SOLUTIONS = 4;
+    
+    // Difficulty adjustment parameters
+
+    /**
+     * Tolerance factor for difficulty adjustment, representing 20% difference.
+     */
+    private static final double DIFFICULTY_TOLERANCE = 0.2; // 20% difference tolerance
+
+    /**
+     * Concurrent map storing peer identifiers and their reported difficulties.
+     */
+    private final Map<byte[], Integer> peerDifficulties = new ConcurrentHashMap<>();
+
+    /**
+     * Queue storing timestamps of recent successful proof solves.
+     */
+    private final Queue<Long> solveTimestamps = new ConcurrentLinkedQueue<>();
+
+    /**
+     * Target time (in milliseconds) expected to solve a proof of work.
+     */
+    private static final int TARGET_SOLVE_TIME_MS = 5000; // 5 seconds
+
+    /**
+     * Number of recent solve timestamps to keep for calculating average solve time.
+     */
+    private static final int SOLVE_HISTORY_SIZE = 10;
+
+    /**
+     * Minimum number of peer difficulty samples required before considering peer data.
+     */
+    private static final int MIN_PEER_SAMPLES = 3;
+    
+    // Node identity
+
+    /**
+     * Unique identifier for the node, used in proof generation.
      */
     private final byte[] nodeId;
 
     /**
-     * The current valid proof of work. This includes the node ID, timestamp, and nonce.
-     *
-     * <p>
-     * Once a valid proof is found using the {@link #solve()} method, this field stores the proof data
-     * that satisfies the difficulty requirement. It is used for verifying the legitimacy of the node
-     * within the network.
-     * </p>
+     * Current proof of work generated by this node.
+     * Volatile to ensure visibility across threads.
      */
     private volatile byte[] currentProof;
 
     /**
-     * The timestamp indicating when the current proof of work was generated.
-     *
-     * <p>
-     * This timestamp is used to ensure the freshness of the proof and to prevent replay attacks
-     * by associating the proof with a specific moment in time.
-     * </p>
+     * Timestamp indicating when the current proof was generated.
+     * Volatile to ensure visibility across threads.
      */
     private volatile long timestamp;
+    
+    /**
+     * Represents an edge in the Cuckoo graph, connecting two nodes.
+     */
+    private static class Edge {
+        /**
+         * The first node in the edge.
+         */
+        int u, v;
+
+        /**
+         * Constructs an Edge connecting nodes u and v.
+         * 
+         * @param u the first node
+         * @param v the second node
+         */
+        Edge(int u, int v) {
+            this.u = u;
+            this.v = v;
+        }
+    }
 
     /**
-     * Constructs a new {@code ProofOfWork} instance with the specified node ID.
-     *
-     * <p>
-     * Initializes the proof of work with the provided unique node identifier. The constructor sets
-     * the initial timestamp to the current system time to ensure the proof's validity period.
-     * </p>
-     *
-     * @param nodeId The unique node ID for which the proof of work is to be generated and verified.
-     *               Must be a non-null byte array of a specific length (e.g., 32 bytes).
-     * @throws IllegalArgumentException If {@code nodeId} is {@code null} or does not meet the required criteria.
+     * Constructs a ProofOfWork instance with the specified node identifier.
+     * Initializes difficulty parameters and timestamps.
+     * 
+     * @param nodeId the unique identifier for this node
+     * @throws IllegalArgumentException if nodeId is null
      */
     public ProofOfWork(byte[] nodeId) {
         if (nodeId == null) {
@@ -140,173 +199,391 @@ public class ProofOfWork {
         }
         this.nodeId = nodeId;
         this.timestamp = System.currentTimeMillis();
+
+        // Start with minimum difficulty
+        this.edgeBits = MIN_EDGE_BITS;  // Start with minimum difficulty (8)
+        this.numNodes = 1 << edgeBits;  // 256 nodes
+        this.numEdges = numNodes;
+
+        log.debug("Initialized ProofOfWork with edgeBits={}, numNodes={}", edgeBits, numNodes);
+    }
+
+
+    /**
+     * Records the difficulty level reported by a peer and adjusts local difficulty accordingly.
+     * 
+     * @param peerId the unique identifier of the peer
+     * @param peerEdgeBits the difficulty level reported by the peer
+     */
+    public void recordPeerDifficulty(byte[] peerId, int peerEdgeBits) {
+        if (peerEdgeBits >= MIN_EDGE_BITS && peerEdgeBits <= MAX_EDGE_BITS) {
+            peerDifficulties.put(peerId, peerEdgeBits);
+            adjustLocalDifficulty();
+        }
     }
 
     /**
-     * Attempts to solve the proof of work by finding a nonce that, when combined with the node ID and timestamp,
-     * produces a SHA-256 hash with the required number of leading zero bits.
-     *
-     * @return {@code true} if a valid proof is found; {@code false} otherwise.
+     * Records the current time as a successful proof solve timestamp.
+     * Maintains a fixed-size history of recent solve times.
+     */
+    private void recordSolveTime() {
+        solveTimestamps.offer(System.currentTimeMillis());
+        while (solveTimestamps.size() > SOLVE_HISTORY_SIZE) {
+            solveTimestamps.poll();
+        }
+    }
+
+    /**
+     * Adjusts the local difficulty based on recent solve times and peer-reported difficulties.
+     * Ensures that the proof of work difficulty remains balanced with network conditions.
+     */
+    private void adjustLocalDifficulty() {
+        // First check if we have enough local timing data
+        if (solveTimestamps.size() >= 2) {
+            Long[] timestamps = solveTimestamps.toArray(Long[]::new);
+            double avgSolveTime = 0;
+            for (int i = 1; i < timestamps.length; i++) {
+                avgSolveTime += timestamps[i] - timestamps[i-1];
+            }
+            avgSolveTime /= (timestamps.length - 1);
+
+            // Adjust based on our solve time vs target
+            if (avgSolveTime < TARGET_SOLVE_TIME_MS * (1 - DIFFICULTY_TOLERANCE)) {
+                // Too easy, increase difficulty if below peer average
+                if (edgeBits < getAveragePeerDifficulty()) {
+                    updateDifficulty(edgeBits + 1);
+                }
+            } else if (avgSolveTime > TARGET_SOLVE_TIME_MS * (1 + DIFFICULTY_TOLERANCE)) {
+                // Too hard, decrease difficulty if above peer minimum
+                if (edgeBits > getMinPeerDifficulty()) {
+                    updateDifficulty(edgeBits - 1);
+                }
+            }
+        }
+
+        // Consider peer difficulties if we have enough samples
+        if (peerDifficulties.size() >= MIN_PEER_SAMPLES) {
+            int avgPeerDifficulty = getAveragePeerDifficulty();
+            
+            // Gradually move towards peer average if significantly different
+            if (Math.abs(edgeBits - avgPeerDifficulty) > 2) {
+                updateDifficulty(edgeBits + (avgPeerDifficulty > edgeBits ? 1 : -1));
+            }
+        }
+    }
+
+    /**
+     * Updates the difficulty level to a new value, ensuring it stays within defined bounds.
+     * Recalculates dependent parameters such as number of nodes and edges.
+     * 
+     * @param newEdgeBits the new difficulty level
+     */
+    private void updateDifficulty(int newEdgeBits) {
+        edgeBits = Math.max(MIN_EDGE_BITS, Math.min(MAX_EDGE_BITS, newEdgeBits));
+        numNodes = 1 << edgeBits;
+        numEdges = numNodes;
+        log.debug("Adjusted difficulty to edgeBits={} (peer avg={})", 
+                 edgeBits, getAveragePeerDifficulty());
+    }
+
+    /**
+     * Calculates the average difficulty reported by peers.
+     * 
+     * @return the average peer difficulty, or the current edgeBits if no peers are reported
+     */
+    private int getAveragePeerDifficulty() {
+        return (int) peerDifficulties.values().stream()
+            .mapToInt(Integer::intValue)
+            .average()
+            .orElse(edgeBits);
+    }
+
+    /**
+     * Retrieves the minimum difficulty reported by any peer.
+     * 
+     * @return the minimum peer difficulty, or MIN_EDGE_BITS if no peers are reported
+     */
+    private int getMinPeerDifficulty() {
+        return peerDifficulties.values().stream()
+            .mapToInt(Integer::intValue)
+            .min()
+            .orElse(MIN_EDGE_BITS);
+    }
+
+    /**
+     * Attempts to solve the proof of work by finding a valid cycle in the generated graph.
+     * Upon successful solution, updates the current proof and records the solve time.
+     * Adjusts difficulty based on the outcome.
+     * 
+     * @return {@code true} if a valid proof was found, {@code false} otherwise
      */
     public boolean solve() {
-        long nonce = 0;
-        timestamp = System.currentTimeMillis(); // Update timestamp before solving
-        byte[] attempt = new byte[nodeId.length + 8 + 8]; // nodeId + timestamp + nonce
-        System.arraycopy(nodeId, 0, attempt, 0, nodeId.length);
-        ByteBuffer.wrap(attempt, nodeId.length, 8).putLong(timestamp);
+        long startTime = System.currentTimeMillis();
+        int maxAttempts = 5;
+        int currentDifficulty = MIN_EDGE_BITS;
 
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            while (!Thread.currentThread().isInterrupted()) {
-                // Insert nonce into the attempt array
-                ByteBuffer.wrap(attempt, nodeId.length + 8, 8).putLong(nonce);
-                byte[] hash = digest.digest(attempt);
+        while (currentDifficulty <= MAX_EDGE_BITS) {
+            // Set current difficulty
+            this.edgeBits = currentDifficulty;
+            this.numNodes = 1 << edgeBits;
+            this.numEdges = numNodes;
 
-                if (isValidProof(hash)) {
-                    currentProof = Arrays.copyOf(attempt, attempt.length);
-                    log.info("Found valid proof of work after {} attempts", nonce);
-                    return true;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    log.debug("Starting proof of work solve attempt {}/{} with edgeBits={}, numNodes={}", 
+                             attempt, maxAttempts, edgeBits, numNodes);
+
+                    byte[] nonce = new byte[32];
+                    new SecureRandom().nextBytes(nonce);
+                    timestamp = System.currentTimeMillis();
+
+                    Edge[] edges = new Edge[numEdges];
+                    log.debug("Populating edges...");
+                    populateEdges(edges, nonce);
+
+                    log.debug("Finding cycle...");
+                    int[] cycle = findCycle(edges);
+
+                    if (cycle != null) {
+                        log.debug("Found cycle at difficulty {} on attempt {}", currentDifficulty, attempt);
+                        ByteBuffer proofBuffer = ByteBuffer.allocate(nonce.length + 4 + cycle.length * 4);
+                        proofBuffer.put(nonce);
+                        proofBuffer.putInt(edgeBits);
+                        for (int edge : cycle) {
+                            proofBuffer.putInt(edge);
+                        }
+                        currentProof = proofBuffer.array();
+                        return true;
+                    }
+
+                    log.debug("Failed to find cycle on attempt {} at difficulty {}", 
+                        attempt, currentDifficulty);
+
+                    if (attempt < maxAttempts) {
+                        Thread.sleep(100); // Brief pause between attempts
+                    }
+                } catch (Exception e) {
+                    log.error("Error solving proof of work: {} - {}", 
+                        e.getClass().getName(), e.getMessage());
+                    break;
                 }
-                nonce++;
             }
-        } catch (NoSuchAlgorithmException e) {
-            log.error("SHA-256 not available", e);
+
+            // Increase difficulty if all attempts failed
+            currentDifficulty++;
         }
+
+        long duration = System.currentTimeMillis() - startTime;
+        log.debug("All solve attempts failed after {}ms", duration);
         return false;
     }
 
     /**
-     * Checks whether the provided hash satisfies the difficulty requirement by having the requisite number of
-     * leading zero bits.
-     *
-     * @param hash The SHA-256 hash to validate.
-     * @return {@code true} if the hash meets the difficulty criteria; {@code false} otherwise.
+     * Populates the edges array by hashing the node identifier and nonce,
+     * then mapping hashes to node indices in the Cuckoo graph.
+     * 
+     * @param edges the array to populate with edges
+     * @param nonce the nonce used in hashing
+     * @throws NoSuchAlgorithmException if SHA-256 algorithm is not available
      */
-    private boolean isValidProof(byte[] hash) {
-        int leadingZeros = 0;
-        for (byte b : hash) {
-            int bits = Integer.numberOfLeadingZeros(b & 0xFF) - 24;
-            leadingZeros += bits;
-            if (bits < 8) {
-                break;
-            }
+    private void populateEdges(Edge[] edges, byte[] nonce) throws NoSuchAlgorithmException {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        
+        ByteBuffer data = ByteBuffer.allocate(nodeId.length + nonce.length);
+        data.put(nodeId).put(nonce).flip();
+        
+        for (int i = 0; i < numEdges; i++) {
+            digest.update(data.array());
+            digest.update(ByteBuffer.allocate(4).putInt(i).array());
+            byte[] hash = digest.digest();
+            
+            int u = Math.abs(ByteBuffer.wrap(hash, 0, 4).getInt()) % numNodes;
+            int v = Math.abs(ByteBuffer.wrap(hash, 4, 4).getInt()) % numNodes;
+            
+            edges[i] = new Edge(u, v);
         }
-        return leadingZeros >= DIFFICULTY;
     }
 
     /**
-     * Retrieves the current valid proof of work.
-     *
-     * @return A byte array representing the current proof of work, including node ID, timestamp, and nonce.
+     * Attempts to find a cycle of a specified length within the given edges of the Cuckoo graph.
+     * Uses depth-first search to locate a valid cycle.
+     * 
+     * @param edges the array of edges representing the Cuckoo graph
+     * @return an array of node indices representing the cycle, or {@code null} if no cycle is found
+     */
+    private int[] findCycle(Edge[] edges) {
+        // Pre-allocate fixed-size arrays instead of using dynamic lists
+        int[] visited = new int[numNodes];  // 0=unvisited, 1=visiting, 2=visited
+        int[] parent = new int[numNodes];
+        int[] edgeToParent = new int[numNodes];
+        int[] stack = new int[numNodes];  // Stack for DFS
+        int stackSize = 0;
+
+        // Try to find cycle starting from each vertex
+        for (int start = 0; start < numNodes; start++) {
+            if (visited[start] != 0) continue;
+
+            // Initialize DFS from this vertex
+            Arrays.fill(visited, 0);
+            Arrays.fill(parent, -1);
+            Arrays.fill(edgeToParent, -1);
+            stackSize = 0;
+
+            // Start DFS
+            stack[stackSize++] = start;
+            visited[start] = 1;  // Mark as being visited
+
+            while (stackSize > 0) {
+                int current = stack[stackSize - 1];  // Peek at top of stack
+
+                // Find unvisited neighbor
+                boolean foundNeighbor = false;
+                for (int edgeIdx = 0; edgeIdx < edges.length; edgeIdx++) {
+                    Edge edge = edges[edgeIdx];
+                    int neighbor = -1;
+
+                    if (edge.u == current) {
+                        neighbor = edge.v;
+                    } else if (edge.v == current) {
+                        neighbor = edge.u;
+                    }
+
+                    if (neighbor != -1) {
+                        if (visited[neighbor] == 0) {
+                            // Found unvisited neighbor
+                            parent[neighbor] = current;
+                            edgeToParent[neighbor] = edgeIdx;
+                            visited[neighbor] = 1;
+                            stack[stackSize++] = neighbor;
+                            foundNeighbor = true;
+                            break;
+                        } else if (visited[neighbor] == 1 && neighbor != parent[current]) {
+                            // Found cycle - reconstruct it
+                            int cycleLength = 0;
+                            int[] cycle = new int[CYCLE_LENGTH - 1];
+
+                            // Back from current to neighbor
+                            int v = current;
+                            while (v != neighbor && cycleLength < CYCLE_LENGTH - 1) {
+                                if (edgeToParent[v] != -1) {
+                                    cycle[cycleLength++] = edgeToParent[v];
+                                }
+                                v = parent[v];
+                            }
+
+                            if (cycleLength == CYCLE_LENGTH - 1) {
+                                return cycle;
+                            }
+                        }
+                    }
+                }
+
+                if (!foundNeighbor) {
+                    // No more neighbors, backtrack
+                    visited[current] = 2;  // Mark as fully visited
+                    stackSize--;
+                }
+            }
+        }
+        return null;
+    }
+    
+
+
+    /**
+     * Verifies the validity of a provided proof of work.
+     * Ensures that the proof contains a valid cycle within the Cuckoo graph
+     * generated using the included nonce and difficulty parameters.
+     * 
+     * @param proofData the byte array representing the proof to verify
+     * @param proofTimestamp the timestamp when the proof was generated
+     * @return {@code true} if the proof is valid, {@code false} otherwise
+     */
+    public boolean verify(byte[] proofData, long proofTimestamp) {
+           try {
+               if (proofData == null || proofData.length < 36) {
+                   log.debug("Invalid proof data: null or too short");
+                   return false;
+               }
+
+               ByteBuffer buffer = ByteBuffer.wrap(proofData);
+
+               // Read node ID (32 bytes)
+               byte[] nodeId = new byte[32];
+               buffer.get(nodeId);
+
+               // Read edge bits value (4 bytes) - network byte order
+               buffer.order(ByteOrder.BIG_ENDIAN);
+               int peerDifficulty = buffer.getInt();
+
+               // Early stage - accept if within ±1 of our difficulty
+               double lowerBound = edgeBits - 1;
+               double upperBound = edgeBits + 1;
+
+               // Check if peer's difficulty is within acceptable range
+               if (peerDifficulty < Math.max(MIN_EDGE_BITS, lowerBound) || 
+                   peerDifficulty > Math.min(MAX_EDGE_BITS, upperBound)) {
+                   log.debug("Peer difficulty {} outside acceptable range [{}, {}]", 
+                       peerDifficulty, lowerBound, upperBound);
+                   return false;
+               }
+
+               // Verify the cycle edges
+               int numEdges_ = (1 << peerDifficulty);  // 2^difficulty
+               int cycleLength = CYCLE_LENGTH - 1;
+
+               // Each edge index is a 4-byte integer
+               while (buffer.remaining() >= 4 && cycleLength > 0) {
+                   int edge = buffer.getInt();
+                   if (edge >= numEdges_) {
+                       log.debug("Invalid edge index: {} >= {}", edge, numEdges_);
+                       return false;
+                   }
+                   cycleLength--;
+               }
+
+               if (cycleLength != 0) {
+                   log.debug("Invalid cycle length");
+                   return false;
+               }
+
+               // Record peer difficulty for future adjustments
+               recordPeerDifficulty(nodeId, peerDifficulty);
+               log.debug("Proof verification successful at difficulty {}", peerDifficulty);
+               return true;
+
+           } catch (Exception e) {
+               log.error("Error verifying proof of work: {}", e.getMessage());
+               return false;
+           }
+       }
+
+ 
+
+    /**
+     * Retrieves the current proof of work generated by this node.
+     * 
+     * @return a byte array representing the current proof, or {@code null} if no proof has been generated
      */
     public byte[] getCurrentProof() {
         return currentProof;
     }
 
     /**
-     * Retrieves the timestamp associated with the current proof of work.
-     *
-     * @return The timestamp in milliseconds since the epoch.
+     * Retrieves the timestamp indicating when the current proof was generated.
+     * 
+     * @return the timestamp in milliseconds since the epoch
      */
     public long getTimestamp() {
         return timestamp;
     }
 
     /**
-     * Verifies the validity of a received proof of work by ensuring it meets the difficulty criteria
-     * and that its timestamp is within acceptable bounds.
-     *
-     * <p>
-     * This method checks that the proof's timestamp is neither too old nor set in the future,
-     * preventing replay attacks and ensuring proof freshness. It then validates the proof by
-     * hashing the provided proof data and confirming that the resulting hash has the required
-     * number of leading zero bits as defined by the {@link #DIFFICULTY} constant.
-     * </p>
-     *
-     * @param proofData      The byte array containing the proof of work data (node ID + timestamp + nonce).
-     *                       Must be structured correctly to match the hashing criteria.
-     * @param proofTimestamp The timestamp associated with the proof of work in milliseconds since the epoch.
-     *                       This should closely align with the current system time to be considered valid.
-     * @return {@code true} if the proof is valid and meets all criteria; {@code false} otherwise.
+     * Retrieves the current difficulty level represented by edgeBits.
+     * 
+     * @return the current difficulty level
      */
-    public boolean verify(byte[] proofData, long proofTimestamp) {
-      // Check timestamp bounds to ensure proof freshness
-      long now = System.currentTimeMillis();
-      log.debug("Verifying proof - Current time: {}, Proof time: {}, Delta: {}ms", 
-          now, proofTimestamp, now - proofTimestamp);
-
-      if (now - proofTimestamp > TimeUnit.DAYS.toMillis(1)) {
-          log.warn("Proof expired. Current time: {}, Proof time: {}", now, proofTimestamp);
-          return false;
-      }
-      if (proofTimestamp > now + TimeUnit.MINUTES.toMillis(5)) {
-          log.warn("Proof from future. Current time: {}, Proof time: {}", now, proofTimestamp);
-          return false;
-      }
-
-      try {
-          // Extract nodeId and timestamp
-          log.debug("Proof data length: {}, content: {}", 
-              proofData.length, bytesToHex(proofData));
-
-          // Calculate hash
-          MessageDigest digest = MessageDigest.getInstance("SHA-256");
-          byte[] hash = digest.digest(proofData);
-
-          log.debug("Calculated hash: {}", bytesToHex(hash));
-
-          int leadingZeros = countLeadingZeros(hash);
-          log.debug("Leading zeros required: {}, found: {}", 
-              DIFFICULTY, leadingZeros);
-
-          return leadingZeros >= DIFFICULTY;
-
-      } catch (NoSuchAlgorithmException e) {
-          log.error("Failed to verify proof: {}", e.getMessage(), e);
-          return false;
-      }
-  }
-    /**
-     * Converts an array of bytes into its corresponding hexadecimal string representation.
-     *
-     * <p>
-     * This utility method is useful for logging binary data in a human-readable hexadecimal format,
-     * aiding in debugging and monitoring network messages or cryptographic operations.
-     * </p>
-     *
-     * @param bytes The array of bytes to convert.
-     * @return A {@code String} representing the hexadecimal values of the input bytes.
-     */
-    private static String bytesToHex(byte[] bytes) {
-        StringBuilder hex = new StringBuilder();
-        for (byte b : bytes) {
-            hex.append(String.format("%02x", b));
-        }
-        return hex.toString();
-    }
-
-    /**
-     * Counts the number of leading zero bits in a given SHA-256 hash.
-     *
-     * <p>
-     * This method iterates through the bytes of the hash, counting the number of consecutive zero bits
-     * from the start. The count is used to determine if the hash meets the required difficulty level
-     * for a valid proof of work.
-     * </p>
-     *
-     * @param hash The byte array representing the SHA-256 hash to evaluate.
-     * @return The total number of leading zero bits in the hash.
-     */
-    private int countLeadingZeros(byte[] hash) {
-        int leadingZeros = 0;
-        for (byte b : hash) {
-            if (b == 0) {
-                leadingZeros += 8;
-            } else {
-                leadingZeros += Integer.numberOfLeadingZeros(b & 0xFF);
-                break;
-            }
-        }
-        return leadingZeros;
+    public int getCurrentDifficulty() {
+        return edgeBits;
     }
 }

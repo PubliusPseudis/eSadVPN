@@ -16,9 +16,12 @@
  */
 package org.publiuspseudis.esadvpn.network;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import org.publiuspseudis.esadvpn.core.VPNConnection;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import org.publiuspseudis.esadvpn.routing.RouteInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -93,7 +96,23 @@ public class Peer {
      * Logger instance for logging information, warnings, and errors.
      */
     private static final Logger log = LoggerFactory.getLogger(Peer.class);
-    
+    private final Map<String, Double> peerReputations = new ConcurrentHashMap<>();
+    public void initializeReputation(String peerId) {
+        peerReputations.put(peerId, RouteInfo.INIT_REPUTATION);
+    }
+
+    public void updatePeerReputation(String peerId, boolean success) {
+        double currentRep = peerReputations.getOrDefault(peerId, RouteInfo.INIT_REPUTATION);
+        if (success) {
+            peerReputations.put(peerId, Math.min(1.0, currentRep + RouteInfo.DELTA_R_POS));
+        } else {
+            peerReputations.put(peerId, Math.max(0.0, currentRep - RouteInfo.DELTA_R_NEG));
+        }
+    }
+
+    public double getPeerReputation(String peerId) {
+        return peerReputations.getOrDefault(peerId, RouteInfo.INIT_REPUTATION);
+    }
     /**
      * The IP address of the peer.
      */

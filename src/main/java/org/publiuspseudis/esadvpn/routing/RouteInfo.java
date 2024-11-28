@@ -89,7 +89,13 @@ public class RouteInfo {
      * Logger instance for logging debug and informational messages.
      */
     private static final Logger log = LoggerFactory.getLogger(RouteInfo.class);
-    
+
+    private static final double ALPHA = 8.0;              // Selection pressure
+    private static final double R_MIN = 0.45;             // Reputation threshold
+    public static final double DELTA_R_NEG = 0.5;        // Negative reputation update
+    public static final double DELTA_R_POS = 0.2;        // Positive reputation update
+    public static final double INIT_REPUTATION = 0.35;   // Initial reputation    
+
     /**
      * The IP address or subnet representing the destination network.
      */
@@ -187,18 +193,30 @@ public class RouteInfo {
     
     /**
      * Calculates and returns the current score of the route based on normalized latency, bandwidth,
-     * and hop count metrics, weighted by their respective importance. The pheromone level further
-     * influences the overall desirability of the route.
+     * and hop count metrics, weighted by their respective importance.The pheromone level further
+ influences the overall desirability of the route.
      *
+     * @param neighborReputation
      * @return The calculated route score as a {@code double}.
      */
+    public double getScore(double neighborReputation) {
+        double latencyFactor = 1.0 / (1 + getLatency());
+        double bandwidthFactor = Math.log1p(getBandwidth()) / 10.0;
+        double distanceFactor = 1.0 / (1 + getHopCount());
+
+        return Math.pow(
+            (pheromoneLevel * neighborReputation) * (
+                0.4 * latencyFactor +
+                0.4 * bandwidthFactor +
+                0.2 * distanceFactor
+            ), 
+            ALPHA
+        );
+    }
+
+    // Keep original method for backward compatibility
     public double getScore() {
-        double latencyScore = 1.0 / (1 + getLatency());
-        double bandwidthScore = Math.log1p(getBandwidth()) / 10.0;
-        double hopScore = 1.0 / (1 + getHopCount());
-        
-        return (latencyScore * 0.4 + bandwidthScore * 0.4 + hopScore * 0.2) 
-               * getPheromoneLevel();
+        return getScore(1.0); // Default to neutral reputation if none provided
     }
 
     /**
@@ -224,23 +242,7 @@ public class RouteInfo {
         pheromoneLevel += quality;
     }
     
-    /**
-     * Calculates and returns the overall route score based on normalized latency, bandwidth, and hop count
-     * metrics, combined with the pheromone level. This method provides a comprehensive measure of the
-     * route's current desirability for packet forwarding.
-     *
-     * @return The overall route score as a {@code double}.
-     */
-    public double getRouteScore() {
-        // Normalize metrics to 0-1 range
-        double latencyScore = 1.0 / (1 + getLatency());
-        double bandwidthScore = Math.log1p(getBandwidth()) / 10.0;
-        double hopScore = 1.0 / (1 + getHopCount());
-        
-        // Weighted combination of metrics
-        return (latencyScore * 0.4 + bandwidthScore * 0.4 + hopScore * 0.2) 
-               * getPheromoneLevel();
-    }
+
 
     // Getters
 

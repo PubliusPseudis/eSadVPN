@@ -192,7 +192,7 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
      * The port number on which this network node listens for peer connections.
      */
     private final int port;
-    
+    private Peer localPeer;  // Add with other fields
     // Configuration constants
     /**
      * The maximum number of peers this node can connect to simultaneously.
@@ -296,7 +296,8 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
         this.bytesSent = new ConcurrentHashMap<>();
         this.bytesReceived = new ConcurrentHashMap<>();
         this.isInitiator = isInitiator;
-
+        this.localPeer = new Peer(ipAddress, port, nodeId);
+        
         // Create executor services with custom thread factories
         this.executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE, r -> {
             Thread t = new Thread(r);
@@ -314,11 +315,16 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
         });
 
         // Initialize core components
+        // Create router without peer first (needed since NetworkStack requires router)
         this.router = new SwarmRouter();
         this.networkStack = new NetworkStack(ipAddress, router);
         this.natHandler = new NATHandler();
         this.pow = new ProofOfWork(nodeId);
-        
+        // Now we can set the owning peer on the router
+        this.router.setOwningPeer(localPeer);
+
+        // Initialize local peer's reputation system
+        this.localPeer.initializeReputation("10.0.0.1"); // Initialize reputation for initiator
         // Create server socket for peer connections
         this.serverSocket = new ServerSocket();
         this.serverSocket.setReuseAddress(true);
@@ -926,7 +932,19 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
             throw new IOException("Handshake failed: " + e.getMessage(), e);
         }
     }
-    
+        /**
+     * Utility method to convert a byte array to a hexadecimal string.
+     *
+     * @param bytes the byte array to convert
+     * @return a hexadecimal string representation of the byte array
+     */
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder hex = new StringBuilder();
+        for (byte b : bytes) {
+            hex.append(String.format("%02x", b));
+        }
+        return hex.toString();
+    }
     /**
      * Handles the establishment of a new peer connection by performing handshake procedures and validating proofs of work.
      *
@@ -942,46 +960,68 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
      * @throws Exception If there is an error during the handshake or validation process.
      */
     private void handleNewPeerConnection(String address, int port, VPNConnection conn) throws Exception {
-        // Wait for peer info and proof
-        log.info("Receiving peer info from {}:{}", address, port);
-        byte[] peerNodeId = conn.receivePeerInfo();
-        log.info("Received peer ID, length: {}", peerNodeId.length);
-        
-        ByteBuffer peerId = ByteBuffer.wrap(peerNodeId);
-        if (peers.containsKey(peerId)) {
-            try (conn) {
-                log.warn("Duplicate peer connection, closing");
+        try {
+            // Wait for peer info and proof
+            log.info("Receiving peer info from {}:{}", address, port);
+
+            // Receive the peer's node ID
+            byte[] peerNodeId = conn.receivePeerInfo();
+            log.info("Received peer ID, length: {}", peerNodeId.length);
+
+            // Wrap the node ID in a ByteBuffer for use as a map key
+            ByteBuffer peerIdBuffer = ByteBuffer.wrap(peerNodeId).asReadOnlyBuffer();
+
+            // Ensure the ByteBuffer is in a consistent state
+            peerIdBuffer.rewind();
+
+            if (peers.containsKey(peerIdBuffer)) {
+                log.warn("Duplicate peer connection from {}, closing", address);
+                conn.close();
+                return;
             }
-            return;
-        }
-        
-        // Get and verify proof of work
-        byte[] proofData = conn.receiveProof();
-        long peerTimestamp = ByteBuffer.wrap(proofData, proofData.length - 8, 8).getLong();
-        
-        if (!pow.verify(Arrays.copyOf(proofData, proofData.length - 8), peerTimestamp)) {
-            try (conn) {
-                log.warn("Invalid proof of work from peer");
+
+            // Receive the proof data from the peer
+            byte[] proof = conn.receiveProof();
+            log.info("Received proof from peer {}, length: {}", address, proof.length);
+
+            // Verify the proof of work
+            boolean isValid = pow.verify(proof, System.currentTimeMillis());
+            if (!isValid) {
+                try (conn) {
+                    log.warn("Invalid proof of work from peer {}, closing connection", address);
+                }
+                return;
             }
-            return;
+
+            // Create and register the new peer
+            Peer peer = new Peer(address, port, peerNodeId);
+            peer.setProofOfWork(proof);
+            peer.setLastProofTimestamp(System.currentTimeMillis());
+            peer.setConnection(conn);
+
+            // Add the peer to the map
+            peers.put(peerIdBuffer, peer);
+            log.info("Added peer to network: {}:{}", address, port);
+
+            // Send initial routes or any required initial data
+            sendInitialRoutes(peer);
+
+            // Handle peer traffic asynchronously
+            executor.submit(() -> handlePeerTraffic(peer));
+
+            // Send acknowledgment to the peer
+            conn.sendMessage(VPNConnection.MSG_TYPE_PEER_INFO, new byte[]{1});  // Simple acknowledgment
+
+            log.info("New peer connection established: {}:{}", address, port);
+        } catch (IOException e) {
+            try (conn) {
+                log.error("Error handling new peer connection from {}:{}", address, port, e);
+            }
+            throw e;  // Rethrow exception if necessary
         }
-        
-        // Create peer
-        Peer peer = new Peer(address, port, peerNodeId);
-        peer.setProofOfWork(Arrays.copyOf(proofData, proofData.length - 8));
-        peer.setLastProofTimestamp(peerTimestamp);
-        peer.setConnection(conn);
-        
-        peers.put(peerId, peer);
-        log.info("Added peer to network: {}:{}", address, port);
-        
-        sendInitialRoutes(peer);
-        executor.submit(() -> handlePeerTraffic(peer));
-        // Send acknowledgment
-        conn.sendMessage(VPNConnection.MSG_TYPE_PEER_INFO, new byte[]{1});  // Simple ack
-        
-        log.info("New peer connection established: {}:{}", address, port);
     }
+
+
 
 
     /**
