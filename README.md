@@ -1,6 +1,6 @@
 # Overview
 
-**ESADVPN (Everyday Swarm Assisted Decentralized VPN)** is a
+**PH3R0M35H (Everyday Swarm Assisted Decentralized VPN)** is a
 peer-to-peer, decentralized Virtual Private Network (VPN) designed to
 provide secure, scalable, and resilient internet access. It leverages
 swarm intelligence for routing and a gossip-based protocol for efficient
