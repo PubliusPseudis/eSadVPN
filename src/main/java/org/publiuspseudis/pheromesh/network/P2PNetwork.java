@@ -1,4 +1,4 @@
-package org.publiuspseudis.esadvpn.network;
+package org.publiuspseudis.pheromesh.network;
 
 /*
  * Copyright (C) 2024 Publius Pseudis
@@ -17,10 +17,10 @@ package org.publiuspseudis.esadvpn.network;
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-import org.publiuspseudis.esadvpn.protocol.GossipMessage;
-import org.publiuspseudis.esadvpn.crypto.ProofOfWork;
-import org.publiuspseudis.esadvpn.core.NetworkStack;
-import org.publiuspseudis.esadvpn.core.VPNConnection;
+import org.publiuspseudis.pheromesh.protocol.GossipMessage;
+import org.publiuspseudis.pheromesh.crypto.ProofOfWork;
+import org.publiuspseudis.pheromesh.core.NetworkStack;
+import org.publiuspseudis.pheromesh.core.VPNConnection;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -47,10 +47,10 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.logging.Level;
-import org.publiuspseudis.esadvpn.network.PeerDiscovery.ConnectionMode;
-import org.publiuspseudis.esadvpn.proxy.SocksProxy;
-import org.publiuspseudis.esadvpn.routing.RouteInfo;
-import org.publiuspseudis.esadvpn.routing.SwarmRouter;
+import org.publiuspseudis.pheromesh.network.PeerDiscovery.ConnectionMode;
+import org.publiuspseudis.pheromesh.proxy.SocksProxy;
+import org.publiuspseudis.pheromesh.routing.RouteInfo;
+import org.publiuspseudis.pheromesh.routing.SwarmRouter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -568,7 +568,7 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
             try {
                 int socksPort = port + 1;  // Use next port for SOCKS proxy
                 log.info("Starting SOCKS proxy on port {}", socksPort);
-                new SocksProxy(networkStack.getUDPHandler(), socksPort);
+                new SocksProxy(networkStack, socksPort);
                 log.info("SOCKS proxy started successfully on port {}", socksPort);
             } catch (IOException e) {
                 log.error("Failed to start SOCKS proxy: {}", e.getMessage());
@@ -1220,58 +1220,75 @@ public final class P2PNetwork implements GossipMessage.GossipHandler, AutoClosea
      * @param peer The {@link Peer} instance representing the newly connected peer.
      * @throws IOException If there is an error while sending routing information.
      */
-    private void sendInitialRoutes(Peer peer) throws IOException {
-        // Always add a direct route to this peer
-        String peerSubnet = peer.getAddress().substring(0, peer.getAddress().lastIndexOf('.')) + ".0";
-        String peerId = Arrays.toString(peer.getNodeId());
+private void sendInitialRoutes(Peer peer) throws IOException {
+    String peerId = Arrays.toString(peer.getNodeId());
+    
+    // For initiator (exit node)
+    if (isInitiator) {
+        // As initiator, we handle internet traffic
+        router.updateRoute("0.0.0.0", "self", 0);  // Direct internet access
+        router.updateMetrics("0.0.0.0", "self", 0.1, 1000000);
+
+        // Add route to this peer's subnet
+        String clientSubnet = peer.getAddress().substring(0, peer.getAddress().lastIndexOf('.')) + ".0";
+        router.updateRoute(clientSubnet, peerId, 1);
+        router.updateMetrics(clientSubnet, peerId, 0.1, 1000000);
         
-        // Add direct route to peer's subnet
-        router.updateRoute(peerSubnet, peerId, 1);
-        
-        // If this is the initiator (10.0.0.1), add route to self for default gateway
-        if (isInitiator) {
-            router.updateRoute("10.0.0.1", peerId, 1);
-            
-            // Add high pheromone level for direct connection
-            String routeKey = "10.0.0.1-" + peerId;
-            router.updateMetrics("10.0.0.1", peerId, 0.1, 1000000); // Low latency, high bandwidth
-        } else {
-            // If we're not the initiator, add route to initiator through this peer if it's 10.0.0.x
-            if (peer.getAddress().startsWith("10.0.0")) {
-                router.updateRoute("10.0.0.1", peerId, 1);
-                router.updateMetrics("10.0.0.1", peerId, 0.1, 1000000);
-            }
+        log.info("Added routes as initiator for client {}", peer.getAddress());
+    } 
+    // For clients connecting to initiator
+    else {
+        // Register peer as initiator if they report themselves as such
+        boolean peerIsInitiator = false;
+        Map<String, RouteInfo> peerRoutes = peer.getConnection().getRoutes();
+        if (peerRoutes != null) {
+            peerIsInitiator = peerRoutes.containsKey("0.0.0.0");
+        }
+
+        if (peerIsInitiator) {
+            // Add default route through this peer for internet traffic
+            router.updateRoute("0.0.0.0", peerId, 1);
+            router.updateMetrics("0.0.0.0", peerId, 0.1, 1000000);
+
+            log.info("Added default route through initiator {}", peer.getAddress());
         }
         
-        // Share current routes
-        Map<String, RouteInfo> currentRoutes = new HashMap<>();
-        for (Map.Entry<String, Map<String, RouteInfo>> entry : router.getRoutes().entrySet()) {
-            String destination = entry.getKey();
-            Map<String, RouteInfo> routes = entry.getValue();
-            
-            for (Map.Entry<String, RouteInfo> routeEntry : routes.entrySet()) {
-                String nextHop = routeEntry.getKey();
-                RouteInfo route = routeEntry.getValue();
-                
-                // Only share routes we're actually using
-                if (route.getScore() > 0) {
-                    currentRoutes.put(destination + "-" + nextHop, route);
-                }
-            }
-        }
-        
-        GossipMessage gossip = new GossipMessage(
-            nodeId,
-            pow.getCurrentProof(),
-            pow.getTimestamp(),
-            new ArrayList<>(peers.values()),
-            currentRoutes
-        );
-        
-        peer.getConnection().sendGossip(gossip);
-        peer.updateLastGossip();
-        log.debug("Sent initial routes to peer: {}", peer.getAddress());
+        // Add direct route to peer
+        router.updateRoute(peer.getAddress(), peerId, 1);
+        router.updateMetrics(peer.getAddress(), peerId, 0.1, 1000000);
     }
+    
+    // Share current routes
+    Map<String, RouteInfo> currentRoutes = new HashMap<>();
+    for (Map.Entry<String, Map<String, RouteInfo>> entry : router.getRoutes().entrySet()) {
+        String destination = entry.getKey();
+        Map<String, RouteInfo> routes = entry.getValue();
+        
+        for (Map.Entry<String, RouteInfo> routeEntry : routes.entrySet()) {
+            String nextHop = routeEntry.getKey();
+            RouteInfo route = routeEntry.getValue();
+            
+            // Only share routes we're actually using
+            if (route.getScore() > 0) {
+                currentRoutes.put(destination + "-" + nextHop, route);
+            }
+        }
+    }
+    
+    // Send route information to peer
+    GossipMessage gossip = new GossipMessage(
+        nodeId,
+        pow.getCurrentProof(),
+        pow.getTimestamp(),
+        new ArrayList<>(peers.values()),
+        currentRoutes
+    );
+    
+    peer.getConnection().sendGossip(gossip);
+    peer.updateLastGossip();
+    log.info("Sent {} routes to peer {}", currentRoutes.size(), peer.getAddress());
+    router.logRoutes();
+}
 
 
     /**

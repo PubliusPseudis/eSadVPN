@@ -14,10 +14,22 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.network;
+package org.publiuspseudis.pheromesh.network;
 
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketException;
+import java.net.UnknownHostException;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
@@ -94,6 +106,41 @@ import org.slf4j.LoggerFactory;
  * @since 2024-01-01
  */
 public class NATHandler {
+
+       // Add minimal new fields for STUN
+    private volatile DatagramSocket stunSocket;
+    private final Map<String, StunEndpoint> stunEndpoints = new ConcurrentHashMap<>();
+    private static final String DEFAULT_STUN_SERVER = "stun.l.google.com";
+    private static final int DEFAULT_STUN_PORT = 19302;
+    
+    private static final String[] STUN_SERVERS = {
+    "stun.l.google.com",     // Google
+    "stun1.l.google.com",    // Google backup
+    "stun.stunprotocol.org", // Open STUN
+    "stun.sipgate.net"       // Sipgate
+};
+    
+    private static final int[] STUN_PORTS = {19302, 19302, 3478, 10000};
+private final Map<String, List<StunEndpoint>> stunEndpointCandidates = new ConcurrentHashMap<>();
+private volatile boolean symmetric = false;
+
+private static class StunEndpoint {
+    final InetSocketAddress mapped;
+    final InetSocketAddress local;
+    final String stunServer;
+    volatile long lastActive;
+    volatile int successCount;
+    volatile double latency;
+
+    StunEndpoint(InetSocketAddress mapped, InetSocketAddress local, String stunServer) {
+        this.mapped = mapped;
+        this.local = local;
+        this.stunServer = stunServer;
+        this.lastActive = System.currentTimeMillis();
+        this.successCount = 1;
+        this.latency = 0;
+    }
+}
     /**
      * Logger instance for logging information, warnings, and errors.
      */
@@ -147,6 +194,7 @@ public class NATHandler {
      * </p>
      */
     public static class NATMapping {
+     
         /**
          * Original source IP address before NAT translation.
          */
@@ -222,66 +270,94 @@ public class NATHandler {
      * @param srcSubnet The source subnet (e.g., "192.168.1.") to identify internal packets.
      * @return The translated packet as a byte array, or the original packet if no translation is performed.
      */
-    public byte[] processOutgoingPacket(byte[] packet, String srcSubnet) {
-        if (packet.length < 20) return packet; // Too small for IP header
-        
-        int protocol = packet[9] & 0xFF;
-        if (protocol != 6 && protocol != 17) { // Not TCP/UDP
-            return packet;
-        }
-        
-        String srcIP = extractIP(packet, 12);
-        String dstIP = extractIP(packet, 16);
-        int srcPort = extractPort(packet, 20);
-        int dstPort = extractPort(packet, 22);
-        
-        // Skip if source is not from our managed subnet
-        if (!srcIP.startsWith(srcSubnet)) {
-            return packet;
-        }
-        
-        // Create or get NAT mapping
-        String connectionKey = String.format("%s:%d-%s:%d/%d", 
-            srcIP, srcPort, dstIP, dstPort, protocol);
-        
-        int mappedPort = addressMappings.computeIfAbsent(connectionKey, k -> {
-            int port = createPortMapping(srcIP, srcPort, dstIP, dstPort, protocol);
-            log.debug("Created new NAT mapping: {} -> :{}", connectionKey, port);
-            return port;
-        });
-        
-        // Update last used timestamp
-        NATMapping mapping = portMappings.get(mappedPort);
-        if (mapping != null) {
-            mapping.lastUsed = System.currentTimeMillis();
+ public byte[] processOutgoingPacket(byte[] packet, String srcSubnet) {
+    if (packet.length < 20) return packet; // Too small for IP header
+    
+    int protocol = packet[9] & 0xFF;
+    if (protocol != 6 && protocol != 17) { // Not TCP/UDP
+        return packet;
+    }
+    
+    String srcIP = extractIP(packet, 12);
+     String dstIP = extractIP(packet, 16);
+    int srcPort = extractPort(packet, 20);
+    int dstPort = extractPort(packet, 22);
+    
+    // Skip if source is not from our managed subnet
+    if (!srcIP.startsWith(srcSubnet)) {
+        return packet;
+    }
+
+    // STUN endpoint handling
+    List<StunEndpoint> candidates = stunEndpointCandidates.get(dstIP);
+    if (candidates != null && !candidates.isEmpty()) {
+        // Select best endpoint based on latency and success rate
+        StunEndpoint bestEndpoint = candidates.stream()
+            .min((a, b) -> Double.compare(
+                a.latency / a.successCount,
+                b.latency / b.successCount
+            )).orElse(null);
+
+        if (bestEndpoint != null && 
+            System.currentTimeMillis() - bestEndpoint.lastActive < 300000) {
             
-            // Track TCP connection state
-            if (protocol == 6) { // TCP
-                int tcpFlags = packet[33] & 0xFF;
-                boolean isSYN = (tcpFlags & 0x02) != 0;
-                boolean isFIN = (tcpFlags & 0x01) != 0;
-                boolean isRST = (tcpFlags & 0x04) != 0;
-                
-                if (isSYN && !mapping.tcpEstablished) {
-                    mapping.tcpEstablished = true;
-                } else if ((isFIN || isRST) && mapping.tcpEstablished) {
-                    mapping.tcpEstablished = false;
+            bestEndpoint.successCount++;
+            packet = rewriteDestination(packet, bestEndpoint.mapped);
+            
+            // Update destination for NAT mapping
+            dstIP = bestEndpoint.mapped.getAddress().getHostAddress();
+            dstPort = bestEndpoint.mapped.getPort();
+        }
+    }
+    
+    // Create or get NAT mapping
+    String connectionKey = String.format("%s:%d-%s:%d/%d", 
+        srcIP, srcPort, dstIP, dstPort, protocol);
+    final String dstIP_final = dstIP; //this is a dirty hack to trick the lambda expression.
+    final int dstPort_final = dstPort;
+    
+    int mappedPort = addressMappings.computeIfAbsent(connectionKey, k -> {
+        int port = createPortMapping(srcIP, srcPort, dstIP_final, dstPort_final, protocol);
+        log.debug("Created new NAT mapping: {} -> :{}", connectionKey, port);
+        return port;
+    });
+    
+    // Update last used timestamp and handle TCP state
+    NATMapping mapping = portMappings.get(mappedPort);
+    if (mapping != null) {
+        mapping.lastUsed = System.currentTimeMillis();
+        
+        // Track TCP connection state
+        if (protocol == 6) { // TCP
+            int tcpFlags = packet[33] & 0xFF;
+            boolean isSYN = (tcpFlags & 0x02) != 0;
+            boolean isFIN = (tcpFlags & 0x01) != 0;
+            boolean isRST = (tcpFlags & 0x04) != 0;
+            
+            if (isSYN && !mapping.tcpEstablished) {
+                mapping.tcpEstablished = true;
+                // If this is a new TCP connection, refresh STUN mappings
+                if (!stunSocket.isClosed()) {
+                    CompletableFuture.runAsync(this::initializeStun);
                 }
+            } else if ((isFIN || isRST) && mapping.tcpEstablished) {
+                mapping.tcpEstablished = false;
             }
         }
-        
-        // Create modified packet with NAT translation
-        byte[] modifiedPacket = packet.clone();
-        
-        // Update source port
-        modifiedPacket[20] = (byte) ((mappedPort >> 8) & 0xFF);
-        modifiedPacket[21] = (byte) (mappedPort & 0xFF);
-        
-        // Recalculate checksums
-        updateChecksums(modifiedPacket);
-        
-        return modifiedPacket;
     }
+    
+    // Create modified packet with NAT translation
+    byte[] modifiedPacket = packet.clone();
+    
+    // Update source port
+    modifiedPacket[20] = (byte) ((mappedPort >> 8) & 0xFF);
+    modifiedPacket[21] = (byte) (mappedPort & 0xFF);
+    
+    // Recalculate checksums
+    updateChecksums(modifiedPacket);
+    
+    return modifiedPacket;
+}
     
     /**
      * Processes an incoming packet for NAT translation.
@@ -409,7 +485,11 @@ public class NATHandler {
      */
     public void cleanupExpiredMappings() {
         long now = System.currentTimeMillis();
-        
+                // Also cleanup stale STUN endpoints
+
+        stunEndpoints.entrySet().removeIf(entry ->
+            now - entry.getValue().lastActive > TimeUnit.MINUTES.toMillis(5)
+        );
         portMappings.entrySet().removeIf(entry -> {
             NATMapping mapping = entry.getValue();
             long timeout = mapping.protocol == 17 ? UDP_TIMEOUT : TCP_TIMEOUT;
@@ -523,7 +603,23 @@ public class NATHandler {
         // Let the kernel handle TCP/UDP checksums as they require pseudo-header
         // Most modern NICs also support checksum offloading
     }
-    
+        private byte[] rewriteDestination(byte[] packet, InetSocketAddress newDest) {
+        byte[] modified = packet.clone();
+        
+        // Rewrite destination IP
+        byte[] addr = newDest.getAddress().getAddress();
+        System.arraycopy(addr, 0, modified, 16, 4);
+        
+        // Rewrite destination port
+        int port = newDest.getPort();
+        modified[22] = (byte)(port >> 8);
+        modified[23] = (byte)port;
+        
+        // Update checksums
+        updateChecksums(modified);
+        
+        return modified;
+    }
     /**
      * Retrieves the current NAT statistics, including total mappings,
      * active TCP and UDP connections, and port usage statistics.
@@ -552,8 +648,125 @@ public class NATHandler {
                 
         return stats;
     }
+private void initializeStun() {
+    CompletableFuture.runAsync(() -> {
+        // Try multiple STUN servers in parallel
+        for (int i = 0; i < STUN_SERVERS.length; i++) {
+            final int index = i;
+            CompletableFuture.runAsync(() -> {
+                try {
+                    discoverMappedAddress(STUN_SERVERS[index], STUN_PORTS[index]);
+                } catch (IOException e) {
+                    log.debug("STUN discovery failed for {}: {}", 
+                        STUN_SERVERS[index], e.getMessage());
+                }
+            });
+        }
+    });
+}
+    private void discoverMappedAddress(String stunServer, int stunPort) throws IOException {
+    if (stunSocket == null || stunSocket.isClosed()) return;
 
+    long startTime = System.nanoTime();
+    byte[] request = createStunBindingRequest();
+    DatagramPacket packet = new DatagramPacket(
+        request, request.length,
+        InetAddress.getByName(stunServer),
+        stunPort
+    );
+
+    // Send request and wait for response
+    stunSocket.setSoTimeout(5000);
+    stunSocket.send(packet);
+
+    byte[] response = new byte[1024];
+    DatagramPacket responsePacket = new DatagramPacket(response, response.length);
+    stunSocket.receive(responsePacket);
+
+    // Calculate latency
+    double latency = (System.nanoTime() - startTime) / 1_000_000.0;
+
+    // Parse response
+    InetSocketAddress mapped = parseStunResponse(responsePacket.getData());
+    if (mapped != null) {
+        InetSocketAddress local = (InetSocketAddress)stunSocket.getLocalSocketAddress();
+        StunEndpoint endpoint = new StunEndpoint(mapped, local, stunServer);
+        endpoint.latency = latency;
+
+        // Store as a candidate
+        stunEndpointCandidates.computeIfAbsent(
+            mapped.getAddress().getHostAddress(),
+            k -> new ArrayList<>()
+        ).add(endpoint);
+
+        // Detect NAT type
+        detectNATType(mapped, local);
+        
+        log.debug("Discovered mapped address: {} via {} (latency: {:.2f}ms)", 
+            mapped, stunServer, latency);
+    }
+}
+        private void detectNATType(InetSocketAddress mapped, InetSocketAddress local) {
+    List<StunEndpoint> candidates = stunEndpointCandidates.get(
+        mapped.getAddress().getHostAddress());
     
+    if (candidates != null && candidates.size() >= 2) {
+        // Compare mapped addresses from different STUN servers
+        boolean differentMappings = candidates.stream()
+            .map(e -> e.mapped.getPort())
+            .distinct()
+            .count() > 1;
+            
+        symmetric = differentMappings;
+        
+        if (symmetric) {
+            log.warn("Detected symmetric NAT - connection issues may occur");
+        }
+    }
+}
+   private byte[] createStunBindingRequest() {
+        byte[] request = new byte[20];
+        // STUN Binding Request Type (0x0001)
+        request[0] = 0x00;
+        request[1] = 0x01;
+        // Message Length (0 bytes)
+        request[2] = 0x00;
+        request[3] = 0x00;
+        // Magic Cookie (0x2112A442)
+        request[4] = 0x21;
+        request[5] = 0x12;
+        request[6] = (byte)0xA4;
+        request[7] = 0x42;
+        // Transaction ID (random 12 bytes)
+        new SecureRandom().nextBytes(Arrays.copyOfRange(request, 8, 20));
+        return request;
+    }
+
+    private InetSocketAddress parseStunResponse(byte[] response) {
+        try {
+            if (response.length < 20) return null;
+            
+            // Verify STUN header
+            if (response[0] != 0x01 || response[1] != 0x01) return null;
+            
+            // Look for MAPPED-ADDRESS attribute (0x0001)
+            for (int i = 20; i < response.length - 8; i += 4) {
+                if (response[i] == 0x00 && response[i + 1] == 0x01) {
+                    // Found MAPPED-ADDRESS
+                    int port = ((response[i + 6] & 0xFF) << 8) | (response[i + 7] & 0xFF);
+                    byte[] addr = Arrays.copyOfRange(response, i + 8, i + 12);
+                    return new InetSocketAddress(
+                        InetAddress.getByAddress(addr),
+                        port
+                    );
+                }
+            }
+        } catch (UnknownHostException e) {
+            log.warn("Failed to parse STUN response: {}", e.getMessage());
+        }
+        return null;
+    }
+        
     /**
      * Constructs a new {@code NATHandler} instance.
      *
@@ -562,5 +775,12 @@ public class NATHandler {
      * required for managing NAT operations within the P2P VPN network.
      * </p>
      */
-    public NATHandler() {}
+    public NATHandler() {
+        try {
+            this.stunSocket = new DatagramSocket();
+            initializeStun();
+        } catch (SocketException e) {
+            log.warn("Failed to initialize STUN support: {}", e.getMessage());
+        }
+    }
 }

@@ -1,7 +1,7 @@
-package org.publiuspseudis.esadvpn.protocol;
+package org.publiuspseudis.pheromesh.protocol;
 
 
-import org.publiuspseudis.esadvpn.protocol.GossipMessage;
+import org.publiuspseudis.pheromesh.protocol.GossipMessage;
 
 /*
  * Copyright (C) 2024 Publius Pseudis

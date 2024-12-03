@@ -14,9 +14,9 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.core;
+package org.publiuspseudis.pheromesh.core;
 
-import org.publiuspseudis.esadvpn.protocol.GossipMessage;
+import org.publiuspseudis.pheromesh.protocol.GossipMessage;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -34,10 +34,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import org.publiuspseudis.esadvpn.crypto.ProofOfWork;
-import org.publiuspseudis.esadvpn.network.P2PNetwork;
-import org.publiuspseudis.esadvpn.crypto.SecureChannel;
-import org.publiuspseudis.esadvpn.protocol.NetworkProtocolHandler;
+import org.publiuspseudis.pheromesh.crypto.ProofOfWork;
+import org.publiuspseudis.pheromesh.network.P2PNetwork;
+import org.publiuspseudis.pheromesh.crypto.SecureChannel;
+import org.publiuspseudis.pheromesh.protocol.NetworkProtocolHandler;
+import org.publiuspseudis.pheromesh.routing.RouteInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -429,7 +430,7 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
         this.currentPhase = ConnectionPhase.INITIAL;
 
         // Initialize crypto and metrics first
-        this.crypto = new SecureChannel();
+        this.crypto = new SecureChannel(isInitiator);
         this.bytesSent = new AtomicLong(0);
         this.bytesReceived = new AtomicLong(0);
         this.lastLatency = Double.MAX_VALUE;
@@ -674,6 +675,15 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
                 packet.getAddress(),
                 packet.getPort()
             );
+            log.debug("Echo packet contents - type: {}, subtype: {}, random data hash: {}", 
+                type,
+                subtype,
+                Arrays.hashCode(randomData));
+
+            // And before sending the response:
+            log.debug("Sending echo response - packet size: {}, response hash: {}", 
+                responsePacket.getLength(),
+                Arrays.hashCode(responsePacket.getData()));
             socket.send(responsePacket);
         } else {
             log.debug("Ignoring non-request echo packet (type: {}, subtype: {})", 
@@ -688,7 +698,7 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
      *
      * @throws Exception If an error occurs during the handshake process.
      */
-    public void performServerHandshake() throws Exception {
+private void performServerHandshake() throws Exception {
         log.debug("[UDP-Listener] Starting server handshake with peer: {}", peerAddress);
 
         try {
@@ -701,13 +711,13 @@ public final class VPNConnection implements NetworkProtocolHandler, AutoCloseabl
 
             log.debug("[UDP-Listener] Using peer's public key, length: {}", peerKey.length);
 
-            // Send our public key unencrypted
-            byte[] publicKey = crypto.getPublicKey();
-            log.debug("[UDP-Listener] Sending our public key, length: {}", publicKey.length);
-            sendMessage(MSG_TYPE_PEER_INFO, publicKey);
+            // Get our public key (with nonce) and send it
+            byte[] ourKey = crypto.getPublicKey();  // This generates and stores our nonce
+            log.debug("[UDP-Listener] Sending our public key, length: {}", ourKey.length);
+            sendMessage(MSG_TYPE_PEER_INFO, ourKey);
 
-            // Establish secure channel
-            crypto.establishSecureChannel(peerKey);
+            // Establish secure channel using the exchanged keys
+            crypto.establishSecureChannel(peerKey);  // This should use stored nonces
 
             // Send acknowledgment
             log.debug("[UDP-Listener] Sending handshake acknowledgment");
@@ -742,14 +752,14 @@ private void echoTest() throws IOException, InterruptedException {
     byte[] randomData = new byte[8];
     new SecureRandom().nextBytes(randomData);
     
-    // Add echo message type byte and request subtype
+    // Important: Create a new buffer for each request to avoid state contamination
     ByteBuffer message = ByteBuffer.allocate(10);
     message.put(MSG_TYPE_ECHO);
     message.put(ECHO_REQUEST);
     message.put(randomData);
     message.flip();
 
-    byte[] requestPacket = message.array();
+    byte[] requestPacket = message.array().clone(); // Clone to ensure clean copy
     DatagramPacket packet = new DatagramPacket(
         requestPacket, 
         requestPacket.length, 
@@ -761,13 +771,11 @@ private void echoTest() throws IOException, InterruptedException {
 
     for (int attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
+            socket.send(packet);
             log.debug("Client sending echo test to {} (attempt {}/{})", 
                 peerAddress, attempt, maxAttempts);
             
-            socket.send(packet);
-
-            // Create receive packet
-            // Wait for response
+            // Create new buffer for response to avoid contamination
             byte[] responseData = new byte[requestPacket.length];
             DatagramPacket responsePacket = new DatagramPacket(
                 responseData, 
@@ -777,51 +785,34 @@ private void echoTest() throws IOException, InterruptedException {
             );
 
             socket.setSoTimeout(1000);
-
-            // Keep reading until we get a valid echo response or timeout
-            long endTime = System.currentTimeMillis() + 1000;  // 1 second total time
-            while (System.currentTimeMillis() < endTime) {
-                socket.receive(responsePacket);
+            socket.receive(responsePacket);
+            
+            // Verify echo response
+            if (responsePacket.getLength() >= 10 &&
+                responseData[0] == MSG_TYPE_ECHO && 
+                responseData[1] == ECHO_RESPONSE) {
                 
-                // Skip if not an echo message
-                if (responsePacket.getLength() < 2) {
-                    continue;
-                }
-
-                if (responseData[0] != MSG_TYPE_ECHO) {
-                    log.debug("Received non-echo message (type: {}), skipping", responseData[0]);
-                    continue;
-                }
-
-                if (responseData[1] != ECHO_RESPONSE) {
-                    log.debug("Received non-response echo message (subtype: {}), skipping", responseData[1]);
-                    continue;
-                }
-
-                // Compare just the random data portion
-                byte[] receivedRandomData = Arrays.copyOfRange(responseData, 2, responseData.length);
-                byte[] sentRandomData = Arrays.copyOfRange(requestPacket, 2, requestPacket.length);
+                // Compare just the random data portion, using clean array slice
+                byte[] receivedRandomData = Arrays.copyOfRange(responseData, 2, 10);
+                byte[] sentRandomData = Arrays.copyOfRange(requestPacket, 2, 10);
                 
                 if (Arrays.equals(receivedRandomData, sentRandomData)) {
                     log.debug("Received valid echo response from {}", 
                         responsePacket.getSocketAddress());
-                    return; // Success
-                } else {
-                    log.debug("Received echo response with mismatched data");
+                    // Critical: Reset socket state before proceeding to handshake
+                    socket.setSoTimeout(5000);
+                    return;
                 }
             }
             
-            // If we get here, we timed out without finding a valid response
             if (attempt == maxAttempts) {
-                throw new IOException("Echo response validation failed after exhausting retries");
+                throw new IOException("Echo test failed after " + maxAttempts + " attempts");
             }
-            log.debug("Echo test attempt {} timed out, retrying...", attempt);
             Thread.sleep(attemptDelay);
             
         } catch (SocketTimeoutException e) {
             if (attempt == maxAttempts) {
-                throw new IOException("UDP connectivity test failed - server not responding after " + 
-                    maxAttempts + " attempts");
+                throw new IOException("UDP connectivity test failed - server not responding");
             }
             log.debug("Echo test attempt {} failed, retrying...", attempt);
             Thread.sleep(attemptDelay);
@@ -1062,7 +1053,10 @@ private void echoTest() throws IOException, InterruptedException {
 
             log.info("Secure channel established with {}", peerAddress);
             currentPhase = ConnectionPhase.NETWORK_HANDSHAKE_COMPLETE;
-
+            log.debug("Handshake state - established: {}, phase: {}, sessionId hash: {}", 
+                crypto.isEstablished(),
+                currentPhase,
+                crypto.getSessionId() != null ? Arrays.hashCode(crypto.getSessionId()) : "null");
         } catch (IOException e) {
             handshakeCompleted = false;
             throw new IOException("Handshake failed: " + e.getMessage(), e);
@@ -1160,37 +1154,68 @@ private void echoTest() throws IOException, InterruptedException {
     }
 
     /**
-     * Processes control messages such as gossip, proof of work, and peer information.
+     * Processes encrypted and unencrypted control messages with security validation.
      *
      * <p>
-     * Depending on the message type, this method delegates processing to the appropriate
-     * handlers. It ensures that control messages are handled securely and correctly,
-     * maintaining the integrity of the VPN connection.
+     * This method handles different types of control messages:
+     * <ul>
+     *   <li>Ping messages (always allowed for connection health checks)</li>
+     *   <li>Gossip messages (requires encrypted channel)</li>
+     *   <li>Proof of work messages (requires encrypted channel)</li>
+     *   <li>Peer information messages (requires encrypted channel)</li>
+     * </ul>
      * </p>
      *
-     * @param type    The type identifier of the received control message.
-     * @param message The {@link ByteBuffer} containing the message data.
-     * @throws IOException If an error occurs during message processing.
+     * <p>
+     * Messages are decrypted if a secure channel is established. For security-sensitive
+     * message types (gossip, proof, peer info), the method enforces encryption and will
+     * reject these messages if received unencrypted. Ping messages are allowed without
+     * encryption to maintain connection health checks.
+     * </p>
+     *
+     * <p>
+     * The method is synchronized when accessing the gossip handler to ensure thread safety.
+     * </p>
+     *
+     * @param type    The type identifier of the control message
+     * @param message The message data as a ByteBuffer
+     *
+     * @throws IOException If an I/O error occurs during message processing
+     *
+     * @implNote 
+     *   - Decryption failures are logged but do not throw exceptions
+     *   - Unknown message types are logged as warnings
+     *   - Unencrypted sensitive messages are rejected with a warning
      */
-    private void handleControlMessage(byte type, ByteBuffer message) {    
+private void handleControlMessage(byte type, ByteBuffer message) {    
         try {
             byte[] data = new byte[message.remaining()];
             message.get(data);
 
-            switch (type) {
-                case MSG_TYPE_PING -> {
-                    // Never encrypt pings
-                    log.debug("Received ping, sending response");
-                    sendMessage(MSG_TYPE_PING, new byte[]{});
+            // Special case for pings - don't decrypt them
+            if (type == MSG_TYPE_PING) {
+                // Always allow pings for connection health checks
+                sendMessage(MSG_TYPE_PING, new byte[]{});
+                return;
+            }
+
+            // Decrypt all other messages if secure channel is established
+            if (crypto.isEstablished() && handshakeCompleted) {
+                try {
+                    data = crypto.decryptMessage(data);
+                } catch (Exception e) {
+                    log.warn("Failed to decrypt message: {}", e.getMessage());
+                    return; // Reject invalid encrypted messages
                 }
+            }
+
+            // Process decrypted message based on type
+            switch (type) {
                 case MSG_TYPE_GOSSIP, MSG_TYPE_PROOF, MSG_TYPE_PEER_INFO -> {
-                    // Only try to decrypt if both secure channel and handshake complete
-                    if (crypto.isEstablished() && handshakeCompleted) {
-                        try {
-                            data = crypto.decryptMessage(data);
-                        } catch (Exception e) {
-                            log.debug("Received unencrypted control message type {} size {}", type, data.length);
-                        }
+                    // Only process these messages if we have a secure channel
+                    if (!crypto.isEstablished() || !handshakeCompleted) {
+                        log.warn("Rejected unencrypted control message of type {}", type);
+                        return;
                     }
 
                     GossipMessage localHandler;
@@ -1206,11 +1231,18 @@ private void echoTest() throws IOException, InterruptedException {
             }
 
         } catch (IOException e) {
-            log.error("Error handling control message of type {} and size {}: {} ({})", 
-                type, message.remaining(), e.getMessage(), e.getClass().getName(), e);
+            log.error("Error handling control message: {}", e.getMessage());
         }
     }
-    
+    public Map<String, RouteInfo> getRoutes() {
+    // If we've completed the network handshake and established secure channel,
+    // gather current routes from the gossip messages
+    if (currentPhase == ConnectionPhase.NETWORK_HANDSHAKE_COMPLETE && 
+        gossipHandler != null) {
+        return new HashMap<>(gossipHandler.getRoutes());
+    }
+    return new HashMap<>(); // Return empty map if not fully connected
+}
     /**
      * Sends a control message to the connected peer.
      *

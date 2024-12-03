@@ -1,6 +1,6 @@
 # Overview
 
-**ESADVPN (Everyday Swarm Assisted Decentralized VPN)** is a
+**pheromesh (Everyday Swarm Assisted Decentralized VPN)** is a
 peer-to-peer, decentralized Virtual Private Network (VPN) designed to
 provide secure, scalable, and resilient internet access. It leverages
 swarm intelligence for routing and a gossip-based protocol for efficient
@@ -115,22 +115,22 @@ compatibility with local applications.
 
 Clone the repository and build the application:
 
-    git clone https://github.com/publiuspseudis/esadvpn.git
-    cd esadvpn
+    git clone https://github.com/publiuspseudis/pheromesh.git
+    cd pheromesh
     mvn clean package
 
-## Running ESADVPN
+## Running pheromesh
 
 **P2P Mode (First Node):**
 
-    java -jar target/esadvpn.jar p2p [port]
+    java -jar target/pheromesh.jar p2p [port]
 
 \*Example:\* Start the first node on port 8942. The SOCKS proxy will
 listen on port 8943.
 
 **Connect Mode (Join Existing Network):**
 
-    java -jar target/esadvpn.jar connect [local-port] [peer-host] [peer-port]
+    java -jar target/pheromesh.jar connect [local-port] [peer-host] [peer-port]
 
 \*Example:\* Join a network via localhost on port 8942. Start the VPN on
 port 8944 and the SOCKS proxy on port 8945.
@@ -157,5 +157,5 @@ See the `LICENSE` file for details.
 # Contact
 
 For issues, suggestions, or inquiries, visit the repository at [GitHub
-Repository](https://github.com/publiuspseudis/esadvpn) or contact
+Repository](https://github.com/publiuspseudis/pheromesh) or contact
 *Publius Pseudis* on Nostr.

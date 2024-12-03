@@ -14,7 +14,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.routing;
+package org.publiuspseudis.pheromesh.routing;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -90,7 +90,7 @@ public class RouteInfo {
      */
     private static final Logger log = LoggerFactory.getLogger(RouteInfo.class);
 
-    private static final double ALPHA = 8.0;              // Selection pressure
+    public static final double ALPHA = 8.0;              // Selection pressure
     private static final double R_MIN = 0.45;             // Reputation threshold
     public static final double DELTA_R_NEG = 0.5;        // Negative reputation update
     public static final double DELTA_R_POS = 0.2;        // Positive reputation update

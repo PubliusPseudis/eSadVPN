@@ -14,13 +14,14 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.core;
+package org.publiuspseudis.pheromesh.core;
 
 import java.io.IOException;
 import java.net.DatagramSocket;
 import java.net.DatagramPacket;
 import java.net.InetAddress;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
@@ -33,9 +34,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.publiuspseudis.esadvpn.network.IPPacket;
-import org.publiuspseudis.esadvpn.routing.SwarmRouter;
-import org.publiuspseudis.esadvpn.network.UDPHandler;
+import org.publiuspseudis.pheromesh.network.IPPacket;
+import org.publiuspseudis.pheromesh.routing.SwarmRouter;
+import org.publiuspseudis.pheromesh.network.UDPHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -432,99 +433,134 @@ public class NetworkStack implements AutoCloseable {
      *
      * @param packet The {@link IPPacket} representing the outbound internet-bound traffic.
      */
-    private void handleOutboundTraffic(IPPacket packet) {
-        if (packet.getProtocol() != IPPacket.PROTO_UDP) {
-            log.debug("Only UDP is currently supported for internet traffic");
+ private void handleOutboundTraffic(IPPacket packet) {
+    if (packet.getProtocol() != IPPacket.PROTO_UDP) {
+        log.debug("Only UDP is currently supported for internet traffic");
+        return;
+    }
+
+    ByteBuffer buffer = null;
+    DatagramSocket internetSocket = null;
+    String destAddr = null;
+
+    try {
+        ByteBuffer payload = packet.getPayload();
+        destAddr = IPPacket.formatIP(packet.getDestinationIP());
+
+        // Get socket info from payload
+        int originalSrcPort = payload.getShort(0) & 0xFFFF;
+        int destPort = payload.getShort(2) & 0xFFFF;
+
+        // Check ACL before creating socket
+        if (!outboundACL.isAllowed(destAddr, destPort)) {
+            log.warn("Outbound connection to {}:{} blocked by ACL", destAddr, destPort);
             return;
         }
 
-        ByteBuffer buffer = null;
-        DatagramSocket internetSocket = null;
-        String destAddr = null;
+        // Get actual data with position handling
+        payload.position(4);
+        ByteBuffer data = payload.slice();
 
-        try {
-            ByteBuffer payload = packet.getPayload();
-            destAddr = IPPacket.formatIP(packet.getDestinationIP());
+        // Create controlled socket
+        internetSocket = createManagedSocket();
+        internetSocket.setSoTimeout(5000);  // 5 second timeout
 
-            // Get socket info from payload
-            int originalSrcPort = payload.getShort(0) & 0xFFFF;
-            int destPort = payload.getShort(2) & 0xFFFF;
+        // Send the data
+        byte[] sendData = new byte[data.remaining()];
+        data.get(sendData);
 
-            // Check ACL before creating socket
-            if (!outboundACL.isAllowed(destAddr, destPort)) {
-                log.warn("Outbound connection to {}:{} blocked by ACL", destAddr, destPort);
-                return;
-            }
+        // Validate destination address
+        InetAddress inetAddr = InetAddress.getByName(destAddr);
+        if (inetAddr.isLoopbackAddress() || inetAddr.isLinkLocalAddress() || 
+            inetAddr.isSiteLocalAddress() || inetAddr.isMulticastAddress()) {
+            log.warn("Rejected connection attempt to restricted address: {}", destAddr);
+            return;
+        }
 
-            // Get actual data with position handling
-            payload.position(4);
-            ByteBuffer data = payload.slice();
+        // Log the outbound request
+        log.debug("Sending {} bytes to {}:{}", sendData.length, destAddr, destPort);
 
-            // Create controlled socket
-            internetSocket = createManagedSocket();
+        DatagramPacket sendPacket = new DatagramPacket(
+            sendData, 
+            sendData.length, 
+            inetAddr, 
+            destPort
+        );
+        internetSocket.send(sendPacket);
 
-            // Send the data
-            byte[] sendData = new byte[data.remaining()];
-            data.get(sendData);
-
-            // Validate destination address
-            InetAddress inetAddr = InetAddress.getByName(destAddr);
-            if (inetAddr.isLoopbackAddress() || inetAddr.isLinkLocalAddress() || 
-                inetAddr.isSiteLocalAddress() || inetAddr.isMulticastAddress()) {
-                log.warn("Rejected connection attempt to restricted address: {}", destAddr);
-                return;
-            }
-
-            DatagramPacket sendPacket = new DatagramPacket(
-                sendData, 
-                sendData.length, 
-                inetAddr, 
-                destPort
-            );
-            internetSocket.send(sendPacket);
-
-            // Wait for response with timeout
-            byte[] receiveData = new byte[MAX_PACKET_SIZE];
-            DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
-            internetSocket.setSoTimeout(5000);  // 5 second timeout
-            internetSocket.receive(receivePacket);
-
-            // Process response
-            ByteBuffer responseBuffer = bufferPool.acquire();
+        // Start response handling loop
+        while (true) {
             try {
-                responseBuffer.putShort((short)originalSrcPort);
-                responseBuffer.putShort((short)destPort);
-                responseBuffer.put(receiveData, 0, receivePacket.getLength());
-                responseBuffer.flip();
+                // Wait for response with timeout
+                byte[] receiveData = new byte[MAX_PACKET_SIZE];
+                DatagramPacket receivePacket = new DatagramPacket(receiveData, receiveData.length);
+                internetSocket.receive(receivePacket);
 
-                // Route response
-                String sourceAddr = IPPacket.formatIP(packet.getSourceIP());
-                String nextHop = router.getNextHop(sourceAddr);
-                if (nextHop != null) {
-                    IPPacket response = IPPacket.create(
-                        IPPacket.PROTO_UDP,
-                        parseIP(destAddr),
-                        parseIP(sourceAddr),
-                        responseBuffer
-                    );
-                    router.routePacket(response.getPacket(), nextHop);
+                // Process response
+                ByteBuffer responseBuffer = bufferPool.acquire();
+                try {
+                    // Create response with swapped ports and original addressing
+                    responseBuffer.putShort((short)destPort);      // Original dest port becomes source
+                    responseBuffer.putShort((short)originalSrcPort); // Original source port becomes dest
+                    responseBuffer.put(receiveData, 0, receivePacket.getLength());
+                    responseBuffer.flip();
+
+                    log.debug("Received {} bytes from {}:{}", 
+                        receivePacket.getLength(), 
+                        receivePacket.getAddress().getHostAddress(), 
+                        receivePacket.getPort());
+
+                    // Route response back through the VPN
+                    String sourceAddr = IPPacket.formatIP(packet.getSourceIP());
+                    String nextHop = router.getNextHop(sourceAddr);
+                    if (nextHop != null) {
+                        // Convert IPs to byte arrays
+                        byte[] srcIP = intToByteArray(packet.getDestinationIP());
+                        byte[] dstIP = intToByteArray(packet.getSourceIP());
+                        
+                        IPPacket response = IPPacket.create(
+                            IPPacket.PROTO_UDP,
+                            srcIP,  // Keep original destination IP as source
+                            dstIP,  // Keep original source IP as destination
+                            responseBuffer
+                        );
+                        router.routePacket(response.getPacket(), nextHop);
+                    } else {
+                        log.warn("No route back to source {}", sourceAddr);
+                    }
+                } finally {
+                    bufferPool.release(responseBuffer);
                 }
-            } finally {
-                bufferPool.release(responseBuffer);
+            } catch (SocketTimeoutException e) {
+                // Normal timeout, break the loop
+                break;
+            } catch (IOException e) {
+                // Connection error, break the loop
+                log.debug("Response receive error: {}", e.getMessage());
+                break;
             }
+        }
 
-        } catch (IOException | InterruptedException e) {
-            log.error("Error handling outbound traffic to {}: {}", destAddr, e.getMessage());
-        } finally {
-            if (internetSocket != null) {
-                internetSocket.close();
-                if (destAddr != null) {
-                    outboundACL.releaseSocket(destAddr);
-                }
+    } catch (IOException | InterruptedException e) {
+        log.error("Error handling outbound traffic to {}: {}", destAddr, e.getMessage());
+    } finally {
+        if (internetSocket != null) {
+            internetSocket.close();
+            if (destAddr != null) {
+                outboundACL.releaseSocket(destAddr);
             }
         }
     }
-    
+}
+
+    private static byte[] intToByteArray(int value) {
+    return new byte[] {
+        (byte)(value >>> 24),
+        (byte)(value >>> 16),
+        (byte)(value >>> 8),
+        (byte)value
+    };
+}
     /**
      * Creates a managed {@link DatagramSocket} with specific configurations to enhance security and performance.
      *
@@ -622,14 +658,21 @@ public class NetworkStack implements AutoCloseable {
      * @param address The IP address as a {@code String}.
      * @return A byte array representing the IP address.
      */
-    private byte[] parseIP(String address) {
-        String[] parts = address.split("\\.");
-        byte[] bytes = new byte[4];
-        for (int i = 0; i < 4; i++) {
-            bytes[i] = (byte) Integer.parseInt(parts[i]);
-        }
-        return bytes;
+private static byte[] parseIP(String addr) {
+    String[] parts = addr.split("\\.");
+    if (parts.length != 4) {
+        throw new IllegalArgumentException("Invalid IP address format: " + addr);
     }
+    byte[] bytes = new byte[4];
+    for (int i = 0; i < 4; i++) {
+        int value = Integer.parseInt(parts[i]);
+        if (value < 0 || value > 255) {
+            throw new IllegalArgumentException("Invalid IP address value: " + value);
+        }
+        bytes[i] = (byte)value;
+    }
+    return bytes;
+}
     
     /**
      * Retrieves the UDP handler associated with this network stack.

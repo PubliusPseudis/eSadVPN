@@ -14,24 +14,24 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.app;
+package org.publiuspseudis.pheromesh.app;
 
-import org.publiuspseudis.esadvpn.proxy.SocksProxy;
-import org.publiuspseudis.esadvpn.network.P2PNetwork;
+import org.publiuspseudis.pheromesh.proxy.SocksProxy;
+import org.publiuspseudis.pheromesh.network.P2PNetwork;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * <p>
  * The {@code Main} class serves as the entry point for the Publius Pseudis Everyday Swarm 
- * Assisted Decentralized VPN (ESADVPN) application. It initializes and manages the lifecycle of 
+ * Assisted Decentralized VPN (pheromesh) application. It initializes and manages the lifecycle of 
  * VPN nodes within a peer-to-peer (P2P) network and sets up a SOCKS proxy to facilitate 
  * secure internet access through the VPN.
  * </p>
  * 
  * <p>
  * <strong>Program Description:</strong>
- * The ESADVPN application allows users to create and join a decentralized VPN network. 
+ * The pheromesh application allows users to create and join a decentralized VPN network. 
  * Users can operate in two primary modes:
  * </p>
  * 
@@ -52,11 +52,11 @@ import org.slf4j.LoggerFactory;
  * </p>
  * <pre>{@code
  * // Start the first VPN node (initiator) on port 8942
- * java -jar esadvpn.jar p2p 8942
+ * java -jar pheromesh.jar p2p 8942
  * // This will start the VPN service on port 8942 and the SOCKS proxy on port 8943
  * 
  * // Connect a second VPN node to the existing network via localhost on port 8942
- * java -jar esadvpn.jar connect 8944 localhost 8942
+ * java -jar pheromesh.jar connect 8944 localhost 8942
  * // This will start the VPN service on port 8944 and the SOCKS proxy on port 8945
  * }</pre>
  * 
@@ -100,7 +100,7 @@ public class Main {
     }
 
     /**
-     * The entry point of the ESADVPN application.
+     * The entry point of the pheromesh application.
      * 
      * <p>
      * Parses command-line arguments to determine the operating mode (p2p or connect), 
@@ -140,7 +140,7 @@ public class Main {
                 case "connect" -> {
                     if (args.length < 4) {
                         System.out.println("Error: peer address and port required for connect mode");
-                        System.out.println("Usage: java -jar esadvpn.jar connect [local-port] [peer-host] [peer-port]");
+                        System.out.println("Usage: java -jar pheromesh.jar connect [local-port] [peer-host] [peer-port]");
                         System.exit(1);
                     }
                     String peerHost = args[2];
@@ -175,14 +175,14 @@ public class Main {
 
 
     /**
-     * Prints the usage instructions for the ESADVPN application.
+     * Prints the usage instructions for the pheromesh application.
      * 
      * <p>
      * Provides guidance on how to execute the program in different modes, along with examples.
      * </p>
      */
     private static void printUsage() {
-        System.out.println("Usage: java -jar esadvpn.jar [mode] [options]");
+        System.out.println("Usage: java -jar pheromesh.jar [mode] [options]");
         System.out.println("Modes:");
         System.out.println("  p2p [port]");
         System.out.println("    Start first node (initiator)");
@@ -196,11 +196,11 @@ public class Main {
         System.out.println();
         System.out.println("Examples:");
         System.out.println("  # Start first node:");
-        System.out.println("  java -jar esadvpn.jar p2p 8942");
+        System.out.println("  java -jar pheromesh.jar p2p 8942");
         System.out.println("  # VPN on 8942, SOCKS proxy on 8943");
         System.out.println();
         System.out.println("  # Connect second node:");
-        System.out.println("  java -jar esadvpn.jar connect 8944 localhost 8942");
+        System.out.println("  java -jar pheromesh.jar connect 8944 localhost 8942");
         System.out.println("  # VPN on 8944, SOCKS proxy on 8945");
     }
 }

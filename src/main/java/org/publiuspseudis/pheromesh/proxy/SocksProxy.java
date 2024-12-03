@@ -14,12 +14,15 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.proxy;
+package org.publiuspseudis.pheromesh.proxy;
 
-import org.publiuspseudis.esadvpn.network.UDPHandler;
+import org.publiuspseudis.pheromesh.network.UDPHandler;
 import java.io.*;
 import java.net.*;
+import java.nio.ByteBuffer;
 import java.util.concurrent.*;
+import org.publiuspseudis.pheromesh.core.NetworkStack;
+import org.publiuspseudis.pheromesh.network.IPPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -90,11 +93,7 @@ public class SocksProxy implements AutoCloseable {
      * The server socket that listens for incoming SOCKS5 client connections.
      */
     private final ServerSocket serverSocket;
-    
-    /**
-     * The {@link UDPHandler} instance responsible for managing UDP traffic through the VPN network.
-     */
-    private final UDPHandler udpHandler;
+
     
     /**
      * Executor service for handling client connections concurrently using a cached thread pool.
@@ -105,6 +104,9 @@ public class SocksProxy implements AutoCloseable {
      * A flag indicating whether the SOCKS proxy server is currently running.
      */
     private volatile boolean running;
+    
+    
+    private final NetworkStack networkStack;  // Added NetworkStack reference    
     
     // SOCKS protocol constants
     
@@ -137,12 +139,12 @@ public class SocksProxy implements AutoCloseable {
      * Constructs a new {@code SocksProxy} instance, initializes the server socket on the specified port,
      * and starts the client acceptance loop.
      *
-     * @param udpHandler The {@link UDPHandler} instance for managing UDP traffic.
+     * @param networkStack The {@link NetworkStack} instance for managing network traffic through the VPN.
      * @param port       The port number on which the SOCKS proxy will listen for incoming connections.
      * @throws IOException If an I/O error occurs when opening the server socket.
      */
-    public SocksProxy(UDPHandler udpHandler, int port) throws IOException {
-        this.udpHandler = udpHandler;
+    public SocksProxy(NetworkStack networkStack, int port) throws IOException {
+        this.networkStack = networkStack;
         this.serverSocket = new ServerSocket(port);
         this.executor = Executors.newCachedThreadPool();
         this.running = true;
@@ -257,7 +259,7 @@ public class SocksProxy implements AutoCloseable {
                    destPort);
 
                // Start forwarding data
-               forwardTraffic(client, target);
+               forwardTraffic(client, destAddr,destPort);
 
            } catch (IOException e) {
                log.error("Error handling SOCKS5 connection: {}", e.getMessage());
@@ -348,66 +350,151 @@ public class SocksProxy implements AutoCloseable {
     /**
      * Forwards traffic between two sockets by continuously reading from the input socket and writing to the output socket.
      *
-     * @param input  The {@link Socket} to read data from.
-     * @param output The {@link Socket} to write data to.
+     * @param client  The {@link Socket} to read data from.
+     * @param destAddr The address {@link String} to send data to.
+     * @param destPort The {@int Port} to send the data to
      */
-    private void forwardTraffic(Socket client, Socket target) {
-        log.debug("Starting traffic forwarding between {} and {}", 
-            client.getRemoteSocketAddress(), 
-            target.getRemoteSocketAddress());
+private void forwardTraffic(Socket client, String destAddr, int destPort) {
+    log.debug("Starting traffic forwarding through VPN to {}:{}", destAddr, destPort);
 
-        Thread clientToTarget = new Thread(() -> {
-            try {
-                InputStream in = client.getInputStream();
-                OutputStream out = target.getOutputStream();
-                byte[] buffer = new byte[8192];
-                int bytesRead;
-
-                while ((bytesRead = in.read(buffer)) != -1) {
-                    log.debug("Client -> Target: {} bytes", bytesRead);
-                    out.write(buffer, 0, bytesRead);
-                    out.flush();
-                }
-            } catch (IOException e) {
-                log.debug("Client -> Target stream closed: {}", e.getMessage());
-            }
-        });
-
-        Thread targetToClient = new Thread(() -> {
-            try {
-                InputStream in = target.getInputStream();
-                OutputStream out = client.getOutputStream();
-                byte[] buffer = new byte[8192];
-                int bytesRead;
-
-                while ((bytesRead = in.read(buffer)) != -1) {
-                    log.debug("Target -> Client: {} bytes", bytesRead);
-                    out.write(buffer, 0, bytesRead);
-                    out.flush();
-                }
-            } catch (IOException e) {
-                log.debug("Target -> Client stream closed: {}", e.getMessage());
-            }
-        });
-
-        clientToTarget.start();
-        targetToClient.start();
-
+    // Create queues for response handling
+    BlockingQueue<ByteBuffer> responseQueue = new LinkedBlockingQueue<>();
+    
+    // Register response handler with NetworkStack
+    UDPHandler.PacketHandler responseHandler = (payload, sourceIP, sourcePort) -> {
         try {
-            clientToTarget.join();
-            targetToClient.join();
+            // Skip port headers in payload (4 bytes)
+            payload.position(4);
+            ByteBuffer data = ByteBuffer.allocate(payload.remaining());
+            data.put(payload);
+            data.flip();
+            responseQueue.put(data);
         } catch (InterruptedException e) {
-            log.warn("Traffic forwarding interrupted");
-        } finally {
-            try {
-                client.close();
-                target.close();
-            } catch (IOException e) {
-                log.debug("Error closing sockets: {}", e.getMessage());
+            log.warn("Response handler interrupted");
+            Thread.currentThread().interrupt();
+        }
+    };
+
+    // Bind to client's local port to receive responses
+    networkStack.getUDPHandler().bind(client.getLocalPort(), responseHandler);
+
+    Thread clientToTarget = new Thread(() -> {
+        try {
+            InputStream in = client.getInputStream();
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+
+            while ((bytesRead = in.read(buffer)) != -1) {
+                log.debug("Client -> Target: {} bytes", bytesRead);
+                
+                // Resolve domain name to IP if needed
+                InetAddress destAddress;
+                try {
+                    // Try parsing as IP first
+                    String[] parts = destAddr.split("\\.");
+                    if (parts.length == 4) {
+                        byte[] addr = new byte[4];
+                        for (int i = 0; i < 4; i++) {
+                            addr[i] = (byte)Integer.parseInt(parts[i]);
+                        }
+                        destAddress = InetAddress.getByAddress(addr);
+                    } else {
+                        // If not IP format, resolve domain name
+                        destAddress = InetAddress.getByName(destAddr);
+                    }
+                } catch (NumberFormatException | UnknownHostException e) {
+                    log.error("Failed to resolve address {}: {}", destAddr, e.getMessage());
+                    return;
+                }
+                
+                // Convert IP to int for NetworkStack
+                byte[] addr = destAddress.getAddress();
+                int destIP = ((addr[0] & 0xFF) << 24) | 
+                           ((addr[1] & 0xFF) << 16) | 
+                           ((addr[2] & 0xFF) << 8) | 
+                           (addr[3] & 0xFF);
+
+                // Create UDP packet with ports and data
+                ByteBuffer packet = ByteBuffer.allocate(bytesRead + 4);
+                packet.putShort((short)client.getLocalPort());  // Source port
+                packet.putShort((short)destPort);              // Destination port
+                packet.put(buffer, 0, bytesRead);              // Data
+                packet.flip();
+
+                // Forward through NetworkStack
+                networkStack.sendPacket(IPPacket.PROTO_UDP, destIP, packet);
             }
+        } catch (IOException e) {
+            log.debug("Client -> Target stream closed: {}", e.getMessage());
+        } finally {
+            // Remove UDP handler when done
+            networkStack.getUDPHandler().unbind(client.getLocalPort());
+        }
+    });
+
+    Thread targetToClient = new Thread(() -> {
+        try {
+            OutputStream out = client.getOutputStream();
+
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    // Wait for response with timeout
+                    ByteBuffer response = responseQueue.poll(5, TimeUnit.SECONDS);
+                    if (response != null) {
+                        byte[] data = new byte[response.remaining()];
+                        response.get(data);
+                        log.debug("Target -> Client: {} bytes", data.length);
+                        out.write(data);
+                        out.flush();
+                    }
+                } catch (InterruptedException e) {
+                    log.debug("Response wait interrupted");
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        } catch (IOException e) {
+            log.debug("Target -> Client stream closed: {}", e.getMessage());
+        }
+    });
+
+    // Set threads as daemon to ensure they don't prevent JVM shutdown
+    clientToTarget.setDaemon(true);
+    targetToClient.setDaemon(true);
+
+    // Start both threads
+    clientToTarget.start();
+    targetToClient.start();
+
+    // Monitor threads and cleanup on exit
+    try {
+        clientToTarget.join();
+        // Interrupt response handler thread since client is done sending
+        targetToClient.interrupt();
+        targetToClient.join(1000); // Wait up to 1 second for cleanup
+    } catch (InterruptedException e) {
+        log.warn("Thread monitoring interrupted");
+        Thread.currentThread().interrupt();
+    } finally {
+        // Cleanup
+        networkStack.getUDPHandler().unbind(client.getLocalPort());
+        try {
+            if (!client.isClosed()) {
+                client.close();
+            }
+        } catch (IOException e) {
+            log.debug("Error closing client socket: {}", e.getMessage());
         }
     }
-    
+}
+    private int ipToInt(String ipAddress) {
+        String[] parts = ipAddress.split("\\.");
+        int result = 0;
+        for (int i = 0; i < 4; i++) {
+            result = (result << 8) | Integer.parseInt(parts[i]);
+        }
+        return result;
+    }
     /**
      * Closes the SOCKS proxy server by stopping the acceptance loop, closing the server socket,
      * shutting down the executor service, and releasing all associated resources.

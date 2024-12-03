@@ -14,16 +14,19 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.routing;
+package org.publiuspseudis.pheromesh.routing;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import org.publiuspseudis.esadvpn.network.Peer;
+import org.publiuspseudis.pheromesh.network.Peer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -265,7 +268,44 @@ public class SwarmRouter {
             }
         }
     }
+    private void addRouteCandidates(List<RouteCandidate> candidates, String destination) {
+    Map<String, RouteInfo> routes = routingTable.get(destination);
+    if (routes != null) {
+        for (Map.Entry<String, RouteInfo> entry : routes.entrySet()) {
+            String nextHop = entry.getKey();
+            RouteInfo route = entry.getValue();
+            
+            // Get pheromone level for this route
+            String key = destination + "-" + nextHop;
+            double pheromone = pheromoneTrails.getOrDefault(key, MIN_PHEROMONE);
+            
+            // Get peer reputation if available
+            double reputation = 1.0;
+            if (owningPeer != null) {
+                reputation = owningPeer.getPeerReputation(nextHop);
+            }
+            
+            candidates.add(new RouteCandidate(route, pheromone, reputation));
+        }
+    }
+}
+    private class RouteCandidate {
+    final RouteInfo route;
+    final double pheromoneLevel;
+    final double reputation;
     
+    RouteCandidate(RouteInfo route, double pheromone, double reputation) {
+        this.route = route;
+        this.pheromoneLevel = pheromone;
+        this.reputation = reputation;
+    }
+    
+    double getWeightedScore() {
+        double score = route.getScore(reputation);
+        return Math.pow(pheromoneLevel * score, RouteInfo.ALPHA);
+    }
+}
+
     /**
      * Determines the next hop peer for a given destination based on route scores and pheromone trails.
      * <p>
@@ -276,56 +316,87 @@ public class SwarmRouter {
      * @param destination The destination network or IP address.
      * @return The identifier of the selected next hop peer, or {@code null} if no route is available.
      */
-    public String getNextHop(String destination) {
-        Map<String, RouteInfo> routes = routingTable.get(destination);
-        if (routes == null || routes.isEmpty()) {
-            // If no specific route found, use default route
-            // For internet traffic, route to the initiator node (10.0.0.1)
-            routes = routingTable.get("10.0.0.1");
-            if (routes == null || routes.isEmpty()) {
-                log.debug("No route to {}", destination);
-                return null;
-            }
-        }
-        
-        // Use probability based on route scores
-        double totalScore = 0;
-        Map<String, Double> scores = new ConcurrentHashMap<>();
-        
-        for (Map.Entry<String, RouteInfo> entry : routes.entrySet()) {
-            String nextHop = entry.getKey();
-            RouteInfo route = entry.getValue();
-            
-            double pheromone = pheromoneTrails.getOrDefault(
-                destination + "-" + nextHop, MIN_PHEROMONE);
-            // Get peer's reputation of this next hop
-            double reputation = owningPeer.getPeerReputation(nextHop);
-            double score = route.getScore(reputation) * pheromone;
-            
-            scores.put(nextHop, score);
-            totalScore += score;
-        }
-        
-        // Probabilistic selection based on scores
-        double random = Math.random() * totalScore;
-        double cumulative = 0;
-        
-        for (Map.Entry<String, Double> entry : scores.entrySet()) {
-            cumulative += entry.getValue();
-            if (random <= cumulative) {
-                return entry.getKey();
-            }
-        }
-        
-        // Fallback to highest scoring route
-        return routes.entrySet().stream()
-            .max((a, b) -> Double.compare(
-                scores.getOrDefault(a.getKey(), 0.0),
-                scores.getOrDefault(b.getKey(), 0.0)))
-            .map(Map.Entry::getKey)
-            .orElse(null);
+ public String getNextHop(String destination) {
+    // Get all possible routes
+    List<RouteCandidate> candidates = new ArrayList<>();
+    
+    // Check exact match
+    addRouteCandidates(candidates, destination);
+    
+    // Check subnet match
+    String subnet = getSubnetForIP(destination);
+    if (!destination.equals(subnet)) {
+        addRouteCandidates(candidates, subnet);
+    }
+    
+    // Check default route
+    addRouteCandidates(candidates, "0.0.0.0");
+
+    if (candidates.isEmpty()) {
+        log.debug("No route found for {}", destination);
+        return null;
     }
 
+    // Calculate total score (based on pheromone levels and route metrics)
+    double totalScore = candidates.stream()
+        .mapToDouble(c -> c.getWeightedScore())
+        .sum();
+
+    // Probabilistic selection based on scores
+    double random = Math.random() * totalScore;
+    double cumulative = 0;
+
+    for (RouteCandidate candidate : candidates) {
+        cumulative += candidate.getWeightedScore();
+        if (random <= cumulative) {
+            // Found our route - reinforce it with success pheromone
+            String key = destination + "-" + candidate.route.getNextHop();
+            double currentPheromone = pheromoneTrails.getOrDefault(key, MIN_PHEROMONE);
+            pheromoneTrails.put(key, Math.min(1.0, currentPheromone + PHEROMONE_DEPOSIT));
+            
+            // Record usage time
+            routeLastUsed.put(key, System.currentTimeMillis());
+            
+            log.debug("Selected route to {} via {} (score={}, pheromone={})", 
+                destination, candidate.route.getNextHop(), 
+                candidate.getWeightedScore(), currentPheromone);
+                
+            return candidate.route.getNextHop();
+        }
+    }
+
+    // Shouldn't reach here, but take highest scoring route if we do
+    RouteCandidate bestRoute = candidates.stream()
+        .max(Comparator.comparingDouble(RouteCandidate::getWeightedScore))
+        .get();
+    
+    return bestRoute.route.getNextHop();
+}
+private String getSubnetForIP(String ipAddress) {
+    // Handle the default route special case
+    if (ipAddress.equals("0.0.0.0")) {
+        return ipAddress;
+    }
+
+    try {
+        String[] parts = ipAddress.split("\\.");
+        if (parts.length == 4) {
+            // Validate each part is a valid number 0-255
+            for (String part : parts) {
+                int value = Integer.parseInt(part);
+                if (value < 0 || value > 255) {
+                    return ipAddress;  // Return original if invalid
+                }
+            }
+            
+            // Return x.y.z.0 format
+            return String.format("%s.%s.%s.0", parts[0], parts[1], parts[2]);
+        }
+    } catch (Exception e) {
+        log.debug("Failed to parse IP address: {}", ipAddress);
+    }
+    return ipAddress;  // Return original if not valid IPv4
+}
     /**
      * Applies pheromone decay to all pheromone trails, simulating the natural evaporation of route
      * desirability over time. Ensures that routes not reinforced by successful usage gradually become
@@ -449,4 +520,20 @@ public class SwarmRouter {
         state.put("routeLastUsed", new HashMap<>(routeLastUsed));
         return state;
     }
+    public void logRoutes() {
+    log.info("Current routes:");
+    for (Map.Entry<String, Map<String, RouteInfo>> entry : routingTable.entrySet()) {
+        String destination = entry.getKey();
+        Map<String, RouteInfo> routes = entry.getValue();
+        for (Map.Entry<String, RouteInfo> routeEntry : routes.entrySet()) {
+            String nextHop = routeEntry.getKey();
+            RouteInfo route = routeEntry.getValue();
+            log.info("  {} -> {} (score={}, pheromone={}, hops={})", 
+                destination, nextHop, 
+                route.getScore(),
+                pheromoneTrails.getOrDefault(destination + "-" + nextHop, MIN_PHEROMONE),
+                route.getHopCount());
+        }
+    }
+}
 }

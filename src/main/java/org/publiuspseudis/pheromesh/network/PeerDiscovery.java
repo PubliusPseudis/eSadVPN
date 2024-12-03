@@ -14,7 +14,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.network;
+package org.publiuspseudis.pheromesh.network;
 
 import java.io.IOException;
 import java.net.DatagramPacket;
@@ -35,8 +35,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import org.publiuspseudis.esadvpn.core.VPNConnection;
-import org.publiuspseudis.esadvpn.crypto.ProofOfWork;
+import org.publiuspseudis.pheromesh.core.VPNConnection;
+import org.publiuspseudis.pheromesh.crypto.ProofOfWork;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

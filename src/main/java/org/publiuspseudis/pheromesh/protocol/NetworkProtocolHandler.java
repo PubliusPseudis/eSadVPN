@@ -1,4 +1,4 @@
-package org.publiuspseudis.esadvpn.protocol;
+package org.publiuspseudis.pheromesh.protocol;
 
 /*
  * Copyright (C) 2024 Publius Pseudis
@@ -19,7 +19,7 @@ package org.publiuspseudis.esadvpn.protocol;
 
 
 import java.io.IOException;
-import org.publiuspseudis.esadvpn.core.ConnectionPhase;
+import org.publiuspseudis.pheromesh.core.ConnectionPhase;
 
 /**
  * <p>

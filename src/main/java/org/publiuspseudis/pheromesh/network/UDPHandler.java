@@ -14,10 +14,14 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package org.publiuspseudis.esadvpn.network;
+package org.publiuspseudis.pheromesh.network;
 
-import org.publiuspseudis.esadvpn.network.IPPacket;
-import org.publiuspseudis.esadvpn.core.NetworkStack;
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import org.publiuspseudis.pheromesh.network.IPPacket;
+import org.publiuspseudis.pheromesh.core.NetworkStack;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -120,7 +124,7 @@ public class UDPHandler {
      * Offset for the length field in the UDP header.
      */
     private static final int LENGTH_OFFSET = 4;
-    
+        private static final int HEADER_SIZE = 4;  // Size of port headers
     /**
      * Offset for the checksum field in the UDP header.
      */
@@ -252,47 +256,66 @@ public class UDPHandler {
      */
     public void handlePacket(IPPacket ipPacket) {
         ByteBuffer udpData = ipPacket.getPayload();
-        if (udpData.remaining() < UDP_HEADER_SIZE) {
+        if (udpData.remaining() < HEADER_SIZE) {
             log.warn("UDP packet too small from {}", IPPacket.formatIP(ipPacket.getSourceIP()));
             return;
         }
         
-        // Parse UDP header
+        // Extract ports from our custom header
         int sourcePort = udpData.getShort(SRC_PORT_OFFSET) & 0xFFFF;
         int destPort = udpData.getShort(DST_PORT_OFFSET) & 0xFFFF;
-        int length = udpData.getShort(LENGTH_OFFSET) & 0xFFFF;
-        
-        // Basic validation
-        if (length != udpData.remaining()) {
-            log.warn("Invalid UDP length from {}:{}", 
-                IPPacket.formatIP(ipPacket.getSourceIP()), sourcePort);
-            return;
-        }
-        
-        // Verify checksum if present
-        int checksum = udpData.getShort(CHECKSUM_OFFSET) & 0xFFFF;
-        if (checksum != 0 && !verifyChecksum(ipPacket)) {
-            log.warn("Invalid UDP checksum from {}:{}", 
-                IPPacket.formatIP(ipPacket.getSourceIP()), sourcePort);
-            return;
-        }
-        
+
+        // Skip port headers to get actual data
+        udpData.position(HEADER_SIZE);
+        ByteBuffer payload = udpData.slice();
+
         // Find port binding
         PortBinding binding = portBindings.get(destPort);
         if (binding != null) {
-            // Extract payload
-            ByteBuffer payload = udpData.duplicate();
-            payload.position(UDP_HEADER_SIZE);
-            payload = payload.slice();
-            
-            // Handle packet
             binding.handler.handlePacket(payload, ipPacket.getSourceIP(), sourcePort);
         } else {
-            log.debug("No handler for UDP port {} from {}:{}", 
-                destPort, IPPacket.formatIP(ipPacket.getSourceIP()), sourcePort);
+            // If we're the initiator (exit node), handle external traffic
+            if (networkStack.getAddress().equals("10.0.0.1")) {
+                handleExitTraffic(sourcePort, ipPacket.getDestinationIP(), destPort, payload);
+            } else {
+                log.debug("No handler for UDP port {} from {}:{}", 
+                    destPort, IPPacket.formatIP(ipPacket.getSourceIP()), sourcePort);
+            }
         }
     }
-    
+        private void handleExitTraffic(int srcPort, int destIP, int destPort, ByteBuffer data) {
+        try (DatagramSocket socket = new DatagramSocket()) {
+            // Send to actual internet destination
+            byte[] bytes = new byte[data.remaining()];
+            data.get(bytes);
+            
+            InetAddress destAddr = InetAddress.getByAddress(
+                ByteBuffer.allocate(4).putInt(destIP).array());
+            
+            DatagramPacket packet = new DatagramPacket(
+                bytes, bytes.length, destAddr, destPort);
+            
+            socket.send(packet);
+            
+            // Wait for response
+            byte[] responseData = new byte[65536];
+            DatagramPacket response = new DatagramPacket(responseData, responseData.length);
+            socket.setSoTimeout(5000);
+            socket.receive(response);
+
+            // Forward response back through VPN
+            ByteBuffer responsePacket = ByteBuffer.allocate(response.getLength() + HEADER_SIZE);
+            responsePacket.putShort((short)destPort);  // Original destination port is now source
+            responsePacket.putShort((short)srcPort);   // Original source port is now destination
+            responsePacket.put(responseData, 0, response.getLength());
+            responsePacket.flip();
+
+            networkStack.injectPacket(responsePacket);
+
+        } catch (IOException e) {
+            log.error("Error handling exit traffic: {}", e.getMessage());
+        }
+    }
     /**
      * Sends a UDP packet to a specified destination IP and port. This method constructs the UDP header,
      * appends the payload, and dispatches the packet through the network stack.
